@@ -1,0 +1,15 @@
+# build artifacts
+*.o
+*.dll
+*.exe
+*.log
+
+# release artifacts (shipped via GitHub Releases, not the repo)
+*.zip
+release_v4.194/
+
+# editor / OS
+*.bak
+*.tmp
+*.swp
+Thumbs.db

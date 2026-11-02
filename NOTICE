@@ -1,0 +1,31 @@
+THIRD-PARTY NOTICES
+===================
+
+This project contains code and firmware from the following third parties:
+
+1. FX3handler (src/FX3handler.cpp, src/FX3handler.h, src/FX3Class.h)
+   - Origin: ExtIO_sddc project (https://github.com/ik1xpv/ExtIO_sddc)
+   - Copyright (c) 2016 Booya Corp, MIT License (booyasdr@gmail.com,
+     http://booyasdr.sf.net)
+   - Copyright (c) 2017-2020 Oscar Steila ik1xpv, MIT License
+   - The original openFX3.cpp was MIT licensed by Booya Corp and modified
+     by ik1xpv; those headers are retained in the files.
+
+2. Cypress CyAPI library (src/CyAPI.cpp, src/CyAPI.h, src/cyioctl.h,
+   src/CyUSB30_def.h, src/UsbdStatus.h, src/usb100.h, src/usb200.h,
+   src/devioctl.h)
+   - Copyright Cypress Semiconductor Corporation, 2009-2012.
+   - "UNPUBLISHED, LICENSED SOFTWARE" - use governed by the license
+     agreement included with the Cypress CyUSB SDK
+     (<install>/license/license.rtf).
+   - These files originate from the Cypress CyUSB SDK and are also
+     distributed as-is by the upstream ExtIO_sddc project.
+
+3. SDDC_FX3.img firmware blob (src/firmware.h)
+   - The embedded FIRMWARE array was generated from SDDC_FX3.img
+     (146268 bytes) of the ExtIO_sddc project (MIT).
+
+4. RX666.img firmware
+   - NOT included in this repository. RX666 users must obtain it from
+     the official RX666 driver package and place it in the SkimSrv
+     directory. See README for details.

@@ -1,0 +1,8 @@
+LIBRARY RX888New.dll
+EXPORTS
+    GetSdrInfo = GetSdrInfo@4
+    ReadPort = ReadPort@4
+    SetCtrlBits = SetCtrlBits@4
+    SetRxFrequency = SetRxFrequency@8
+    StartRx = StartRx@4
+    StopRx = StopRx@0
