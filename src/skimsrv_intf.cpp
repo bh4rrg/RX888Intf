@@ -402,7 +402,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
         }
     }
     Log("UnpauseMode=%d (0=gentle: [dm+0x98]=0+PostMessage only; 1=forced: also write state=3)", gUnpauseMode);
-    Log("StartRx: v4.194 (FIR direct-read input block, no delay-line memcpy, -march=x86-64-v3 -ffast-math)");
+    Log("StartRx: v4.195 (USB recovery hardening: watchdog Reopen + bus precheck + storm guard, -march=x86-64-v3 -ffast-math)");
 
     // v4.176: 标度与老驱动对齐（ini OutputScale，默认 1000）。
     // 旧硬编码 131072 = 老驱动标度的 131 倍（+42dB），S 表/水位全错。
@@ -680,7 +680,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
     // DLL 卸载，唤醒后踩已释放代码页 → RX888Intf.dll_unloaded 退出崩溃（根因）。
     // shutdown 为幂等：stop_+SetEvent+WaitAll+关句柄，与析构/init 重启均兼容。
     eng->shutdownPool();
-    Log("DDC pool shutdown done (v4.193)");
+    Log("DDC pool shutdown done (v4.195)");
 
     gDspReady = false;
     // v4.177: MinGW 32 位下 delete DDC_Engine 崩溃（与 ringbuffer/CyAPI 同类问题），
