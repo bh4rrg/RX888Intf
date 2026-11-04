@@ -30,9 +30,6 @@ SkimSrv.exe 所在目录，无需编译。
 工具链：MinGW-w64 GCC，32 位目标（DLL 必须与 32 位 SkimSrv 进程
 匹配）。
 
-```
-build.bat              （使用 C:\msys64\mingw32\bin\g++.exe）
-```
 
 编译参数为强制项，不得修改
 唯一的外部 DLL 依赖是 libwinpthread-1.dll。
