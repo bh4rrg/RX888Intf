@@ -1,13 +1,4 @@
----
-AIGC:
-  ContentProducer: '001191110102MAD55U9H0F10002'
-  ContentPropagator: '001191110102MAD55U9H0F10002'
-  Label: '1'
-  ProduceID: 'c215c6d4-e959-423e-b460-f3fa3ab2e816'
-  PropagateID: 'c215c6d4-e959-423e-b460-f3fa3ab2e816'
-  ReservedCode1: 'af0f1804-7ed9-4978-ad88-8de10544ae86'
-  ReservedCode2: 'af0f1804-7ed9-4978-ad88-8de10544ae86'
----
+
 
 # RX888Intf — CW Skimmer Server 的 RX888/RX666 驱动 DLL
 
