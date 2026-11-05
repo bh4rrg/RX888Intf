@@ -6,7 +6,6 @@
 
 # release artifacts (shipped via GitHub Releases, not the repo)
 *.zip
-release_v4.194/
 release_v4.195/
 release_v*/
 
