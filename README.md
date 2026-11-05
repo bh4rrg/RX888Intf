@@ -38,7 +38,6 @@ SkimSrv.exe 所在目录，无需编译。
 
 ```
 src/          驱动源码（skimsrv_intf.cpp + DSP 流水线 + CyAPI）
-tools/        验证与基准测试工具
 LICENSE       MIT
 NOTICE        第三方来源声明（ExtIO_sddc、Cypress CyAPI、固件）
 ```
@@ -99,7 +98,6 @@ Requirements: CW Skimmer Server 1.6.x (32-bit), Cypress FX3 USB driver
 
 ```
 src/          driver source (skimsrv_intf.cpp + DSP pipeline + CyAPI)
-tools/        verification & benchmark harnesses
 LICENSE       MIT
 NOTICE        third-party attribution (ExtIO_sddc, Cypress CyAPI, firmware)
 ```
