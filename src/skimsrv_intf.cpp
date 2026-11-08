@@ -116,56 +116,143 @@ typedef struct {
 } StartRxParams;
 
 // ---------------------------------------------------------------------------
-// 日志（可开关，输出到 DLL 同目录 RX888New.log）
+// 日志（三级开关，输出到 DLL 同目录 RX888New.log）
+// v4.197: LogMode ini 开关（[RX888] LogMode，缺省 0）——
+//   0=完全静默：不创建/不写任何日志文件（正常运行默认，零写盘开销）
+//   1=精简：仅验收行（StartRx ok / stat / QPC / 首块交付）+ 错误 + 致命告警
+//   2=全量：v4.196 及之前的完整行为（排障用）
+//   致命告警（ReportError / USB RECOVERY EXHAUSTED）无视 LogMode 强制落盘
+//   （v4.174 响亮告警原则：skimmer 无声死是最坏结局）。
+//   v4.197 陷阱堵漏：SharedDdcLog（DbgPrintf 桥）旧实现会自动重开日志文件，
+//   使静默模式失效——现静默/精简下不再自动打开，Force 通道不受限。
+//   64MB 轮转：LogMode>=1 打开时若文件 >=64MB 先改名 RX888New.log.old。
 // ---------------------------------------------------------------------------
 static FILE* gLog = nullptr;
 static CRITICAL_SECTION gLogCS;
 static bool gLogCSInit = false;
-static void LogOpen() {
-    if (!gLogCSInit) { InitializeCriticalSection(&gLogCS); gLogCSInit = true; }
-    if (gLog) return;
-    char path[MAX_PATH], dir[MAX_PATH];
+static int  gLogMode = -1;      // -1=未读, 0=silent, 1=terse, 2=full
+
+static bool GetSelfDir(char* out) {
+    char path[MAX_PATH];
     HMODULE self = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCSTR)&LogOpen, &self);
+                       (LPCSTR)&GetSelfDir, &self);
     if (self && GetModuleFileNameA(self, path, MAX_PATH)) {
-        strcpy(dir, path);
-        char* p = strrchr(dir, '\\');
-        if (p) { *p = 0; strcpy(path, dir); strcat(path, "\\RX888New.log"); }
-        else strcpy(path, "RX888New.log");
-    } else strcpy(path, "RX888New.log");
+        strcpy(out, path);
+        char* p = strrchr(out, '\\');
+        if (p) { *p = 0; return true; }
+    }
+    out[0] = 0;
+    return false;
+}
+
+static void LoadLogMode() {
+    if (gLogMode >= 0) return;
+    char dir[MAX_PATH], ini[MAX_PATH];
+    if (GetSelfDir(dir)) { strcpy(ini, dir); strcat(ini, "\\RX888Intf.ini"); }
+    else strcpy(ini, "RX888Intf.ini");
+    int m = GetPrivateProfileIntA("RX888", "LogMode", 0, ini);
+    if (m < 0 || m > 2) m = 0;
+    gLogMode = m;
+}
+
+static void LogI(const char* fmt, ...);
+static void LogAnnounceOpen();
+static void LogOpen() {
+    if (!gLogCSInit) { InitializeCriticalSection(&gLogCS); gLogCSInit = true; }
+    if (gLog) return;
+    LoadLogMode();
+    if (gLogMode == 0) return;      // 静默：不打开文件
+    char dir[MAX_PATH], path[MAX_PATH];
+    if (GetSelfDir(dir)) { strcpy(path, dir); strcat(path, "\\RX888New.log"); }
+    else strcpy(path, "RX888New.log");
+    // v4.197: 64MB 轮转——旧日志改名 .old（只保留一代）
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &fa)) {
+        unsigned long long sz = ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+        if (sz >= 64ull * 1024 * 1024) {
+            char old[MAX_PATH];
+            strcpy(old, path); strcat(old, ".old");
+            MoveFileExA(path, old, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+    gLog = fopen(path, "a");
+    LogAnnounceOpen();
+}
+
+// 致命告警通道：无视 LogMode 强制打开（v4.174 响亮告警原则）
+static void LogOpenForce() {
+    if (!gLogCSInit) { InitializeCriticalSection(&gLogCS); gLogCSInit = true; }
+    if (gLog) return;
+    char dir[MAX_PATH], path[MAX_PATH];
+    if (GetSelfDir(dir)) { strcpy(path, dir); strcat(path, "\\RX888New.log"); }
+    else strcpy(path, "RX888New.log");
     gLog = fopen(path, "a");
 }
+
 static void LogClose() {
     if (gLog) { fclose(gLog); gLog = nullptr; }
 }
-static void Log(const char* fmt, ...) {
-    if (!gLog) return;
+
+static void LogWrite(const char* fmt, va_list ap) {
     EnterCriticalSection(&gLogCS);
     SYSTEMTIME st; GetLocalTime(&st);
     fprintf(gLog, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    va_list ap; va_start(ap, fmt);
     vfprintf(gLog, fmt, ap);
-    va_end(ap);
     fprintf(gLog, "\n");
     fflush(gLog);
     LeaveCriticalSection(&gLogCS);
+}
+// 全量级：仅 LogMode=2 写（63 处既有调用点默认归此级）
+static void Log(const char* fmt, ...) {
+    if (!gLog || gLogMode < 2) return;
+    va_list ap; va_start(ap, fmt);
+    LogWrite(fmt, ap);
+    va_end(ap);
+}
+// 精简级（验收行）：LogMode>=1 写
+static void LogI(const char* fmt, ...) {
+    if (!gLog || gLogMode < 1) return;
+    va_list ap; va_start(ap, fmt);
+    LogWrite(fmt, ap);
+    va_end(ap);
+}
+// 强制级（错误/致命告警）：任何 LogMode 都写（静默下自动强制打开文件）
+static void FatalLog(const char* fmt, ...) {
+    if (!gLog) LogOpenForce();
+    if (!gLog) return;
+    va_list ap; va_start(ap, fmt);
+    LogWrite(fmt, ap);
+    va_end(ap);
 }
 
 // v4.180: 统一日志通道——DdcLog 桥使用同一个 FILE* 和 CRITICAL_SECTION
 // 旧实现 usb_shim.cpp 自带 gUsbLog=fopen(同文件) 是独立 FILE* 句柄，
 // 两路并发写同一文件在无互斥下腐蚀 CRT 堆元数据（ntdll 0xc0000005 根因）
+// v4.197: 静默/精简下不再自动重开文件（旧实现 if(!gLog)LogOpen() 会让
+// DbgPrintf 绕过 LogMode=0 静默）；mode=2 行为与旧版一致。致命告警走
+// SharedDdcLogForce（usb_shim DdcLogForce / config.h DbgPrintfForce）。
 extern "C" void SharedDdcLog(const char* fmt, va_list args) {
+    LoadLogMode();
+    if (gLogMode < 2) return;
     if (!gLog) LogOpen();
     if (!gLog) return;
-    EnterCriticalSection(&gLogCS);
-    SYSTEMTIME st; GetLocalTime(&st);
-    fprintf(gLog, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
-    vfprintf(gLog, fmt, args);
-    fprintf(gLog, "\n");
-    fflush(gLog);
-    LeaveCriticalSection(&gLogCS);
+    LogWrite(fmt, args);
+}
+extern "C" void SharedDdcLogForce(const char* fmt, va_list args) {
+    if (!gLog) LogOpenForce();
+    if (!gLog) return;
+    LogWrite(fmt, args);
+}
+
+// 首次成功打开日志文件时记一行（LogI 在上方定义，此处可见）
+static bool gLogOpenAnnounced = false;
+static void LogAnnounceOpen() {
+    if (gLog && !gLogOpenAnnounced) {
+        gLogOpenAnnounced = true;
+        LogI("[log] RX888New.log opened (LogMode=%d)", gLogMode);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +315,7 @@ static const double   FS_MID          = 2000000.0;           // 中间速率 2M
 // ---------------------------------------------------------------------------
 static void ReportError(const char* text) {
     if (gSet.pErrorProc) {
-        Log("ERROR: %s", text);
+        FatalLog("ERROR: %s", text);
         gSet.pErrorProc(gSet.THandle, (char*)text);
         gStopReq = true;
     }
@@ -273,7 +360,7 @@ static double LoadOutputScale() {
         int cfg = GetPrivateProfileIntA("RX888", "OutputScale", 0, path);
         if (cfg > 0) scale = (double)cfg;
     }
-    Log("OutputScale=%.1f (RX888Intf.ini)", scale);
+    LogI("OutputScale=%.1f (RX888Intf.ini)", scale);
     return scale;
 }
 
@@ -401,8 +488,8 @@ static DWORD WINAPI DeliverThread(LPVOID) {
             gUnpauseMode = GetPrivateProfileIntA("RX888", "UnpauseMode", 0, iniPath);
         }
     }
-    Log("UnpauseMode=%d (0=gentle: [dm+0x98]=0+PostMessage only; 1=forced: also write state=3)", gUnpauseMode);
-    Log("StartRx: v4.195 (USB recovery hardening: watchdog Reopen + bus precheck + storm guard, -march=x86-64-v3 -ffast-math)");
+    LogI("UnpauseMode=%d (0=gentle: [dm+0x98]=0+PostMessage only; 1=forced: also write state=3)", gUnpauseMode);
+    LogI("StartRx: v4.197 (LogMode ini 三级日志开关, 默认静默 + 64MB 轮转 + DbgPrintf 静默堵漏; v4.196 waitBatch 混合同步, -march=x86-64-v3 -ffast-math)");
 
     // v4.176: 标度与老驱动对齐（ini OutputScale，默认 1000）。
     // 旧硬编码 131072 = 老驱动标度的 131 倍（+42dB），S 表/水位全错。
@@ -440,21 +527,16 @@ static DWORD WINAPI DeliverThread(LPVOID) {
     int qpcSampleCount = 0;
 
     // 预取第 0 块并转换
-    // v4.186-5: 去 Sleep(1)（15.6ms 精度陷阱）
+    // v4.196: UsbPeekReadPtr→getReadPtr 内部为阻塞等待（短自旋后 CV 休眠，
+    //   ring Stop() 唤醒），gStopReq 通过 UsbStopStream 的 ring Stop() 生效，
+    //   外层轮询循环是死代码，已删除（v4.186-5 遗留的裸 peek 自旋）
     {
-        int spin = 0;
-        while (!gStopReq) {
-            blkNext = (int16_t*)UsbPeekReadPtr(gRing);
-            if (blkNext) break;
-            ++spin;
-            if ((spin & 1023) == 0) Sleep(0);
-            else _mm_pause();
-        }
+        blkNext = (int16_t*)UsbPeekReadPtr(gRing);
     }
     if (!blkNext) {
         // v4.190: 提前退出路径也必须关 worker 池（同主退出路径）
         eng->shutdownPool();
-        Log("deliver: no first block, exiting (gStopReq=%d)", (int)(bool)gStopReq); return 0; }
+        FatalLog("deliver: no first block, exiting (gStopReq=%d)", (int)(bool)gStopReq); return 0; }
     wbDcBlocker.applyRe(rawCur, blkNext, n);
     UsbReadDone(gRing);
     ++usbBlocks;
@@ -466,19 +548,10 @@ static DWORD WINAPI DeliverThread(LPVOID) {
 
     while (!gStopReq) {
         // 1. 主线程重叠工作 A：预取并转换下一块（与 worker DDC 并行）
-        // v4.186-5: 预取轮询去 Sleep(1)——Windows Sleep(1) 实际精度 15.6ms，
-        // ring 非空时零延迟、空时每 1024 次 _mm_pause 后 Sleep(0) 让出时间片。
-        blkNext = nullptr;
-        {
-            int spin = 0;
-            while (!gStopReq) {
-                blkNext = (int16_t*)UsbPeekReadPtr(gRing);
-                if (blkNext) break;
-                ++spin;
-                if ((spin & 1023) == 0) Sleep(0);   // 偶尔让出时间片（无 15ms 损失）
-                else _mm_pause();                     // 超线程友好自旋
-            }
-        }
+        // v4.196: 同上——UsbPeekReadPtr 内部阻塞（短自旋后 CV 休眠），
+        //   v4.186-5 的外层轮询自旋是死代码（peek 空时根本不返回），已删除。
+        //   空环返回 nullptr 时退出主循环（peek 仅在 Stop 后返回 null）。
+        blkNext = (int16_t*)UsbPeekReadPtr(gRing);
         QueryPerformanceCounter(&qpcNow);
         tPreFetch += (uint64_t)((qpcNow.QuadPart - qpcPrev.QuadPart) * qpcInv);
         qpcPrev = qpcNow;
@@ -602,7 +675,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
                 gSet.pIQProc((int)gTHandle, deliver);
                 ++deliverCalls;
                 if (deliverCalls == 1) {
-                    Log("first IQ block delivered (after %llu usb blocks)",
+                    LogI("first IQ block delivered (after %llu usb blocks)",
                         (unsigned long long)usbBlocks);
                 }
                 // v4.177: 解码器解暂停——SkimSrv 状态机在 StartRx 后卡在
@@ -645,7 +718,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
         // 周期性统计（每 1000 块 ≈ 1.02 秒）+ v4.187-10 QPC 插桩汇总
         if ((usbBlocks % 1000) == 0) {
             double sec = usbBlocks * (double)n / (double)ADC_FREQ;
-            Log("stat usb=%llu dsp=%llu deliver=%llu (%.1f blocks/s) delivered=%lu",
+            LogI("stat usb=%llu dsp=%llu deliver=%llu (%.1f blocks/s) delivered=%lu",
                 (unsigned long long)usbBlocks, (unsigned long long)dspCalls,
                 (unsigned long long)deliverCalls,
                 deliverCalls / sec, gBlocksDelivered);
@@ -657,7 +730,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
                 uint64_t loopSum = tPreFetch + tApplyRe + tCollect + tWait + tFlip
                                  + tRetune + tSwap + tSubmit + tDeliver + tStat;
                 uint64_t idleUs = (wallUs > loopSum) ? (wallUs - loopSum) : 0;
-                Log("QPC n=%d wall=%.0fus: prefetch=%llu applyRe=%llu collect=%llu wait=%llu flip=%llu retune=%llu swap=%llu submit=%llu deliver=%llu stat=%llu loopSum=%llu idle=%llu (us/1000blk)",
+                LogI("QPC n=%d wall=%.0fus: prefetch=%llu applyRe=%llu collect=%llu wait=%llu flip=%llu retune=%llu swap=%llu submit=%llu deliver=%llu stat=%llu loopSum=%llu idle=%llu (us/1000blk)",
                     qpcSampleCount, (double)wallUs,
                     (unsigned long long)tPreFetch, (unsigned long long)tApplyRe,
                     (unsigned long long)tCollect, (unsigned long long)tWait,
@@ -680,7 +753,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
     // DLL 卸载，唤醒后踩已释放代码页 → RX888Intf.dll_unloaded 退出崩溃（根因）。
     // shutdown 为幂等：stop_+SetEvent+WaitAll+关句柄，与析构/init 重启均兼容。
     eng->shutdownPool();
-    Log("DDC pool shutdown done (v4.195)");
+    LogI("DDC pool shutdown done (v4.197)");
 
     gDspReady = false;
     // v4.177: MinGW 32 位下 delete DDC_Engine 崩溃（与 ringbuffer/CyAPI 同类问题），
@@ -700,7 +773,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
         WaitForSingleObject(gDeliverSuicideEvent, 3000);
     }
     if (InterlockedCompareExchange(&gDeliverKilled, 0, 0) == 0) {
-        Log("deliver thread: StopRx did not terminate in 3s, falling back to return");
+        FatalLog("deliver thread: StopRx did not terminate in 3s, falling back to return");
         return 0;
     }
     return 0;   // 已被标记 killed（理论不可达）
@@ -804,7 +877,7 @@ void __stdcall StartRx(void* rawParams) {
     // 启动 USB 流（4 并发队列，目标环形缓冲）
     UsbStartStream(gFx3, &gRing);
     gStarted = true;
-    Log("StartRx ok: rate=%d block=%d nCh=%d THandle=%d",
+    LogI("StartRx ok: rate=%d block=%d nCh=%d THandle=%d",
         gSampleRate, gBlockInSamples, gRecvCount, gSet.THandle);
 }
 
@@ -1039,7 +1112,7 @@ void __stdcall StopRx(void) {
             if (InterlockedCompareExchange(&gDeliverAtSafePoint, 0, 0)) { atSafe = TRUE; break; }
             // 若线程已意外退出（return 路径），句柄会 signal
             DWORD wq = WaitForSingleObject(gThread, 20);
-            if (wq == WAIT_OBJECT_0) { exited = TRUE; Log("StopRx: thread exited by itself (unexpected path)"); break; }
+            if (wq == WAIT_OBJECT_0) { exited = TRUE; FatalLog("StopRx: thread exited by itself (unexpected path)"); break; }
         }
         DWORD t1 = GetTickCount();
         if (atSafe) {
@@ -1050,13 +1123,13 @@ void __stdcall StopRx(void) {
             Log("StopRx: deliver thread terminated");
         } else if (!exited) {
             DWORD wr = WaitForSingleObject(gThread, 15000);
-            Log("StopRx: WaitForSingleObject returned %lu (0=SIGNALED 258=TIMEOUT)", wr);
+            FatalLog("StopRx: WaitForSingleObject returned %lu (0=SIGNALED 258=TIMEOUT)", wr);
             if (wr != WAIT_OBJECT_0) {
-                Log("WARN: deliver thread did not exit in 15s, forcing TerminateThread");
+                FatalLog("WARN: deliver thread did not exit in 15s, forcing TerminateThread");
                 InterlockedExchange(&gDeliverKilled, 1);
                 TerminateThread(gThread, 0);
                 WaitForSingleObject(gThread, 2000);
-                Log("StopRx: deliver thread force-terminated");
+                FatalLog("StopRx: deliver thread force-terminated");
             }
         }
         CloseHandle(gThread); gThread = nullptr;
@@ -1071,7 +1144,7 @@ void __stdcall StopRx(void) {
     FreeBlocks();
     gDspReady = false;
     gStarted = false;
-    Log("StopRx done, delivered=%lu", gBlocksDelivered);
+    LogI("StopRx done, delivered=%lu", gBlocksDelivered);
 }
 
 // ---------------------------------------------------------------------------

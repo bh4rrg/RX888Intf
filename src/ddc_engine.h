@@ -1,4 +1,8 @@
 // ddc_engine.h v3 - 高速多通道 DDC 引擎（用于新 RX888 SkimSrv 驱动）
+// v4.196：waitBatch 混合同步（短自旋 + WaitAll doneEv_）——CDC 归因（2026-11-06，
+//   实机 QPC 263 样本）：主线程 wait 段 332µs/块为纯自旋烧核（主线程唯一真实烧核
+//   等待点，prefetch 段在 ringbuffer 内早已是 CV 休眠）。改为短自旋覆盖快路径后
+//   落内核事件，预期整机进程 CPU 60% → ~57%。worker 完成处新增 SetEvent(doneEv_)。
 // v3.1（v4.190）：DDC_Engine 增加 shutdownPool()——退出路径必须显式关闭
 //   worker 线程池。引擎按 MinGW32 泄漏策略不 delete，析构永远不执行；
 //   交付线程被 TerminateThread 后无人能再 shutdown，worker 存活至 DLL
@@ -153,24 +157,41 @@ public:
         // 不等待，立即返回——主线程去做重叠工作
     }
 
-    // v4.186-6: 纯自旋同步——主线程 waitBatch 忙等 volatile doneEpoch_（mov 级读，
-    // 无 Interlocked 锁前缀、无内核 WaitAll/SetEvent 往返）。worker 完成写
-    // doneEpoch_ 后主线程立刻发现。每 16384 次自旋插一次 Sleep(0) 让出 CPU，
-    // 防止饿死其他线程。worker 侧：完成后立即回查新批（epoch 已增则继续做），
-    // 不会休眠；只有主线程尚未提交下批（低频）才进事件等待，由 submit 的
-    // SetEvent(wakeEv_) 唤醒，不存在错失唤醒。
+    // v4.196: 混合同步——短自旋（快路径零内核开销：实机实测 wait 仅 ~1.2µs/批，
+    // 2 万次轻读自旋 ≈ 100µs 窗口完全覆盖）→ 未完成则 WaitForMultipleObjects
+    // WaitAll 等 batchN_ 个 manual-reset doneEv_（慢路径内核休眠）。CDC 归因
+    //（2026-11-06 实机 QPC 263 样本）：wait 段 332µs/块为纯自旋烧核，是主线程
+    // 唯一真实烧核等待点（prefetch 段在 ringbuffer 内早已是 CV 休眠）；本改动
+    // 预期整机进程 CPU 60% → ~57%。唤醒延迟 ~10-50µs << 1.024ms 块周期，
+    // 且 prefetch 段还有 ~565µs USB 等待缓冲，实时性无损。
+    // 事件序：worker 先写 doneEpoch_ 后 SetEvent（锁前缀 + 内核调用双重栅栏），
+    // 主线程见事件置位则 epoch 必可见；WAIT_TIMEOUT/提前返回后一律回查 epoch
+    // 确认，事件不作为完成依据。已知的极端边界（worker 在 epoch 写与 SetEvent
+    // 两条指令间被长时间抢占，陈旧 SetEvent 污染后续批次事件）后果为有界内核
+    // 速轮询直至该 worker 追平，自愈无丢失，概率可忽略。worker 侧回查逻辑
+    // 不变：完成后立即看新批（epoch 已增则继续做），不额外休眠。
     void waitBatch() {
         if (nWorkers_ <= 0 || batchN_ <= 0) return;   // 串行退化：submit 已同步完成
         LONG myEpoch = curEpoch_;
-        int spin = 0;
+        // 快路径：短自旋（结构同 ringbuffer spin_count_boost：轻读为主，偶发 pause）
+        for (int spin = 0; spin < 20000; ++spin) {
+            bool all = true;
+            for (int i = 0; i < batchN_; ++i) {
+                if (doneEpoch_[i] < myEpoch) { all = false; break; }
+            }
+            if (all) return;
+            if ((spin & 1023) == 1023) _mm_pause();   // 超线程友好
+        }
+        // 慢路径：内核 WaitAll（doneEv_ 为 manual-reset，submitBatch 已 ResetEvent）；
+        // 5 秒超时兑底：worker 全部停摆时每 5s 重查一次（与旧版无限等语义一致）
         for (;;) {
             bool all = true;
             for (int i = 0; i < batchN_; ++i) {
                 if (doneEpoch_[i] < myEpoch) { all = false; break; }
             }
             if (all) return;
-            if ((++spin & 16383) == 0) Sleep(0);   // 偶尔让出时间片
-            else _mm_pause();
+            DWORD w = WaitForMultipleObjects((DWORD)batchN_, doneEv_, TRUE, 5000);
+            if (w == WAIT_FAILED) Sleep(1);   // 句柄异常退避，防忙循环
         }
     }
 
@@ -211,8 +232,12 @@ private:
             if (idx < batchN_) {
                 runOne(batchJobs_[idx]);
             }
-            // v4.186-7: 完成只写 doneEpoch_（主线程 waitBatch 纯自旋读，无需事件）
+            // v4.186-7: 完成只写 doneEpoch_（主线程快路径自旋读）
+            // v4.196: 完成后 SetEvent(doneEv_)——主线程 waitBatch 慢路径 WaitAll
+            // 的唤醒源。先写 epoch 后 SetEvent（栅栏序），submitBatch 处已有
+            // ResetEvent 清理跨批残留。代价 ~1µs/次 × 8ch × 93.7/s ≈ 0.1% 单核。
             InterlockedExchange(&doneEpoch_[idx], myEpoch);
+            SetEvent(doneEv_[idx]);
         }
     }
 

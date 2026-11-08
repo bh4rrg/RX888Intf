@@ -41,6 +41,7 @@
 // firmware version mismatch) were invisible in RX888Intf.log. Route them to
 // the log file via the DdcLog bridge (defined in RX888Intf.cpp).
 extern "C" void DdcLog(const char *fmt, va_list args);
+extern "C" void DdcLogForce(const char *fmt, va_list args);
 #include <stdarg.h>
 inline void DbgPrintfToFile(const char *fmt, ...) {
     va_list args;
@@ -48,7 +49,14 @@ inline void DbgPrintfToFile(const char *fmt, ...) {
     DdcLog(fmt, args);
     va_end(args);
 }
+inline void DbgPrintfForceToFile(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    DdcLogForce(fmt, args);
+    va_end(args);
+}
 #define DbgPrintf(fmt, ...) DbgPrintfToFile("[SDDC] " fmt, ##__VA_ARGS__)
+#define DbgPrintfForce(fmt, ...) DbgPrintfForceToFile("[SDDC] " fmt, ##__VA_ARGS__)
 #endif
 
 #define SWVERSION           "1.3.0 RC1"	  

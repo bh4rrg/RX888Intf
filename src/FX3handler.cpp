@@ -931,17 +931,17 @@ void fx3handler::AdcSamplesProcess()
  			// as clean failures; only 60 s of stable flow refills it.
  			// If all attempts fail, the thread exits with a loud alarm
  			// block (was: silent exit, skimmer died without a trace).
- 			if (recoverCount >= USB_MAX_RECOVER) {
-				DbgPrintf("\n");
-				DbgPrintf("======================================================================\n");
-				DbgPrintf("  USB RECOVERY EXHAUSTED after %d attempts (v4.195)\n", recoverCount);
-				DbgPrintf("  Root cause: firmware DMA / USB pipe hard-dead (CRC errors,\n");
-				DbgPrintf("  10-27 incident signature). RX666 firmware has no software reset.\n");
-				DbgPrintf("  ACTION REQUIRED: unplug+replug the USB cable, then restart\n");
-				DbgPrintf("  SkimSrv. The ADC thread is stopping NOW to avoid writing a\n");
-				DbgPrintf("  half-dead stream into the DSP.\n");
-				DbgPrintf("======================================================================\n");
-				DbgPrintf("\n");
+			if (recoverCount >= USB_MAX_RECOVER) {
+				DbgPrintfForce("\n");
+				DbgPrintfForce("======================================================================\n");
+				DbgPrintfForce("  USB RECOVERY EXHAUSTED after %d attempts (v4.195)\n", recoverCount);
+				DbgPrintfForce("  Root cause: firmware DMA / USB pipe hard-dead (CRC errors,\n");
+				DbgPrintfForce("  10-27 incident signature). RX666 firmware has no software reset.\n");
+				DbgPrintfForce("  ACTION REQUIRED: unplug+replug the USB cable, then restart\n");
+				DbgPrintfForce("  SkimSrv. The ADC thread is stopping NOW to avoid writing a\n");
+				DbgPrintfForce("  half-dead stream into the DSP.\n");
+				DbgPrintfForce("======================================================================\n");
+				DbgPrintfForce("\n");
 				break;
 			}
 

@@ -19,17 +19,28 @@ uint32_t N2_BANDSWITCH = 64000000;
 
 // v4.180: 统一日志通道——不再独立 fopen 同一文件（双 FILE* 并发写腐蚀堆）
 // 改为调用 skimsrv_intf.cpp 的 SharedDdcLog（共用 FILE* + CRITICAL_SECTION）
+// v4.197: 增加 Force 通道（致命告警无视 LogMode 强制落盘）
 extern "C" void SharedDdcLog(const char *fmt, va_list args);
+extern "C" void SharedDdcLogForce(const char *fmt, va_list args);
 
 // va_list 版本（config.h 的 DbgPrintf 调用）
 extern "C" void DdcLog(const char* fmt, va_list args) {
     SharedDdcLog(fmt, args);
+}
+extern "C" void DdcLogForce(const char* fmt, va_list args) {
+    SharedDdcLogForce(fmt, args);
 }
 
 // printf 风格内部辅助（shim 自身使用）——v4.180 统一到 SharedDdcLog
 static void UsbLog(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt);
     SharedDdcLog(fmt, ap);
+    va_end(ap);
+}
+// v4.197: 强制版辅助（shim 自身致命路径用）
+static void UsbLogForce(const char* fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    SharedDdcLogForce(fmt, ap);
     va_end(ap);
 }
 
