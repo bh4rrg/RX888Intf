@@ -934,7 +934,7 @@ void fx3handler::AdcSamplesProcess()
 			if (recoverCount >= USB_MAX_RECOVER) {
 				DbgPrintfForce("\n");
 				DbgPrintfForce("======================================================================\n");
-				DbgPrintfForce("  USB RECOVERY EXHAUSTED after %d attempts (v4.195)\n", recoverCount);
+				DbgPrintfForce("  USB RECOVERY EXHAUSTED after %d attempts (" RX888INTF_VERSION ")\n", recoverCount);
 				DbgPrintfForce("  Root cause: firmware DMA / USB pipe hard-dead (CRC errors,\n");
 				DbgPrintfForce("  10-27 incident signature). RX666 firmware has no software reset.\n");
 				DbgPrintfForce("  ACTION REQUIRED: unplug+replug the USB cable, then restart\n");
@@ -1114,8 +1114,12 @@ void fx3handler::StopStream()
 			// v4.177 leak policy), and the ADC thread touches it once more
 			// before honouring run=false. Nulling it here was a use-after-
 			// null race (StopStream caller vs recovery path).
-			DbgPrintf("StopStream: ADC thread still busy after 10 s (recovery in "
-				"progress?) - detached, inputbuffer left valid\n");
+			// v4.198: DbgPrintf -> DbgPrintfForce——脱管属于必须知晓的事件
+			//（残留 ADC 线程会拖住进程退出，v4.191 实测 ~40 s），LogMode=0
+			// 静默模式下同样必须落盘。
+			DbgPrintfForce("StopStream: ADC thread still busy after 10 s (recovery in "
+				"progress?) - detached, inputbuffer left valid (process exit "
+				"may be delayed by up to ~40 s)\n");
 		}
 		else {
 			DbgPrintf("StopStream: WaitForSingleObject done\n");

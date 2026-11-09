@@ -67,6 +67,7 @@
 #include <algorithm>
 
 #include "ddc_engine.h"
+#include "config.h"   // v4.198: RX888INTF_VERSION 版本宏（启动横幅引用）
 
 // ---------------------------------------------------------------------------
 // SkimSrv 接口类型（与老驱动 RX888Intf.cpp 完全对齐——SkimSrv 按此布局解析）
@@ -489,7 +490,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
         }
     }
     LogI("UnpauseMode=%d (0=gentle: [dm+0x98]=0+PostMessage only; 1=forced: also write state=3)", gUnpauseMode);
-    LogI("StartRx: v4.197 (LogMode ini 三级日志开关, 默认静默 + 64MB 轮转 + DbgPrintf 静默堵漏; v4.196 waitBatch 混合同步, -march=x86-64-v3 -ffast-math)");
+    LogI("StartRx: " RX888INTF_VERSION " (LogMode ini 三级日志开关, 默认静默 + 64MB 轮转 + DbgPrintf 静默堵漏; v4.196 waitBatch 混合同步, -march=x86-64-v3 -ffast-math)");
 
     // v4.176: 标度与老驱动对齐（ini OutputScale，默认 1000）。
     // 旧硬编码 131072 = 老驱动标度的 131 倍（+42dB），S 表/水位全错。
@@ -753,7 +754,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
     // DLL 卸载，唤醒后踩已释放代码页 → RX888Intf.dll_unloaded 退出崩溃（根因）。
     // shutdown 为幂等：stop_+SetEvent+WaitAll+关句柄，与析构/init 重启均兼容。
     eng->shutdownPool();
-    LogI("DDC pool shutdown done (v4.197)");
+    LogI("DDC pool shutdown done (" RX888INTF_VERSION ")");
 
     gDspReady = false;
     // v4.177: MinGW 32 位下 delete DDC_Engine 崩溃（与 ringbuffer/CyAPI 同类问题），
