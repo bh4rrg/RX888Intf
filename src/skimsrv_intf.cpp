@@ -274,6 +274,21 @@ static Cmplx* gFill[MAX_RX_COUNT] = {0};    // 当前填充缓冲（指向 A 或
 static int  gFillIdx[MAX_RX_COUNT] = {0};       // 每通道块内已填样本数
 static unsigned long gBlocksDelivered = 0;
 
+// v4.199: IQ 落盘探针（子 Hz 级验证 DLL 音频轴，默认关闭）
+//   ini: [RX888] IQDumpCh=3,4  IQDumpSec=200
+//   每通道写 DLL 同目录 RX888IQ_ch<N>.iq：裸 float32 交错 I/Q（Re,Im），
+//   即 pIQProc 实际收到的内容，速率 = 当前输出率。无缓冲写入，进程被杀也不丢已写部分。
+static int   gIqDumpChans[MAX_RX_COUNT] = {0};
+static int   gIqDumpNCh = 0;
+static FILE* gIqDumpFiles[MAX_RX_COUNT] = {nullptr};
+static long long gIqDumpBlocksLeft = 0;
+static long long gIqDumpBlocksTotal = 0;
+// v4.199: 采集期间把落盘通道的 LO 临时改到指定频率（用于 MW 9k 栅格绝对参考）
+//   0 = 不改。采集结束后自动恢复 SkimSrv 下发的真实 LO。
+// v4.200: 改为按通道一一对应（IQDumpLo=10080000,9920000，顺序同 IQDumpCh），
+//   一次采集即可在同一基准载波上得到多个音频点，直接拟合 alpha/beta。
+static double gIqDumpLoList[MAX_RX_COUNT] = {0};
+
 // v4.181: 交付线程安全点退出机制（绕开 CRT TLS 清理死锁）
 // 交付线程循环退出后不 return（return 会触发 MinGW CRT endthread 清理，
 // free gomp/winpthread TLS 分配时与主线程堆操作互锁——现场实抓）。
@@ -363,6 +378,203 @@ static double LoadOutputScale() {
     }
     LogI("OutputScale=%.1f (RX888Intf.ini)", scale);
     return scale;
+}
+
+// v4.199: IQ 落盘配置（IQDumpCh 逗号分隔通道号；IQDumpSec<=0 或缺省即禁用）
+static void LoadIqDumpConfig() {
+    char dir[MAX_PATH], ini[MAX_PATH], buf[256];
+    gIqDumpNCh = 0;
+    if (!GetSelfDir(dir)) return;
+    strcpy(ini, dir); strcat(ini, "\\RX888Intf.ini");
+    int sec = GetPrivateProfileIntA("RX888", "IQDumpSec", 0, ini);
+    buf[0] = 0;
+    GetPrivateProfileStringA("RX888", "IQDumpCh", "", buf, sizeof(buf), ini);
+    if (sec <= 0 || buf[0] == 0) return;
+    // 进程内只武装一次：SkimSrv 在 USB 打不开时会每 3 秒重试 StartRx，
+    //   若每次都 fopen("wb") 会把已采到的数据截断清零。
+    static bool sIqDumpArmedOnce = false;
+    if (sIqDumpArmedOnce) return;
+    sIqDumpArmedOnce = true;
+    const char* p = buf;
+    char lobuf[128]; lobuf[0] = 0;
+    GetPrivateProfileStringA("RX888", "IQDumpLo", "", lobuf, sizeof(lobuf), ini);
+    while (*p && gIqDumpNCh < MAX_RX_COUNT) {
+        while (*p == ' ' || *p == ',') ++p;
+        if (*p == 0) break;
+        int ch = atoi(p);
+        while (*p && *p != ',') ++p;
+        if (ch < 0 || ch >= gRecvCount) {
+            LogI("IQDump: ch%d out of range (nCh=%d), skipped", ch, gRecvCount);
+            continue;
+        }
+        gIqDumpChans[gIqDumpNCh++] = ch;
+    }
+    if (gIqDumpNCh == 0) return;
+    // v4.200: 解析 IQDumpLo 列表并与通道一一对应；只给一个值则套用到全部通道
+    {
+        double vals[MAX_RX_COUNT] = {0}; int nv = 0;
+        const char* q = lobuf;
+        while (*q && nv < MAX_RX_COUNT) {
+            while (*q == ' ' || *q == ',') ++q;
+            if (*q == 0) break;
+            vals[nv++] = atof(q);
+            while (*q && *q != ',') ++q;
+        }
+        for (int k = 0; k < gIqDumpNCh; ++k) {
+            if (nv == 0) gIqDumpLoList[k] = 0.0;
+            else gIqDumpLoList[k] = vals[(nv == 1) ? 0 : (k < nv ? k : nv - 1)];
+            if (gIqDumpLoList[k] > 0)
+                LogI("IQDump: ch%d will be retuned to %.0f Hz", gIqDumpChans[k], gIqDumpLoList[k]);
+        }
+    }
+    gIqDumpBlocksTotal = (long long)sec * (long long)gSampleRate / (long long)gBlockInSamples;
+    gIqDumpBlocksLeft  = gIqDumpBlocksTotal;
+    for (int k = 0; k < gIqDumpNCh; ++k) {
+        char path[MAX_PATH];
+        sprintf(path, "%s\\RX888IQ_ch%d.iq", dir, gIqDumpChans[k]);
+        gIqDumpFiles[k] = fopen(path, "wb");
+        if (gIqDumpFiles[k]) setvbuf(gIqDumpFiles[k], nullptr, _IONBF, 0);
+        LogI("IQDump: ch%d -> %s (%.1f MB)", gIqDumpChans[k], path,
+             (double)gIqDumpBlocksTotal * (double)gBlockInSamples * 8.0 / 1048576.0);
+    }
+    LogI("IQDump armed: chans=%d sec=%d blocks=%lld rate=%d block=%d blockSamples=%d",
+         gIqDumpNCh, sec, gIqDumpBlocksTotal, gSampleRate, gBlockInSamples, gBlockInSamples);
+}
+
+static void CloseIqDump() {
+    for (int k = 0; k < gIqDumpNCh; ++k) {
+        if (gIqDumpFiles[k]) { fclose(gIqDumpFiles[k]); gIqDumpFiles[k] = nullptr; }
+    }
+    gIqDumpNCh = 0;
+    gIqDumpBlocksLeft = 0;
+}
+
+// ---------------------------------------------------------------------------
+// v4.201: 合成 CW 注入探针
+//   往交付给 SkimSrv 的某个通道里叠加一个已知音频频率、已知呼号的 CW 信号，
+//   用于直接测量 SkimSrv 的 spot 上报换算（不依赖传播、不依赖硬件）。
+//   ini: [RX888] InjectCh=3  InjectAmp=3000  InjectWpm=20  InjectSegSec=150
+//                InjectList=8000:K1ABC,25000:K2ABC,45000:K3ABC,70000:K4ABC
+//   每个音频点持续 InjectSegSec 秒，走完一轮后自动停止（避免残留假 spot）。
+// ---------------------------------------------------------------------------
+static bool   gInjectOn = false;
+static int    gInjectCh = -1;
+static float  gInjectAmp = 3000.0f;
+static int    gInjectWpm = 20;
+static int    gInjectNSeg = 0;
+static double gInjectAudio[8];
+static char   gInjectCall[8][24];
+static int    gInjectSegBlocks = 0;
+static int    gInjectSegLeft = 0;
+static int    gInjectTotalLeft = 0;
+static int    gInjectSegIdx = 0;
+static float* gInjectEnv = nullptr;
+static int    gInjectEnvLen = 0;
+static int    gInjectPos = 0;
+static double gInjectPhase = 0.0;
+
+static const char* MorseOf(char c) {
+    static const char* t[26] = {".-","-...","-.-.","-..",".","..-.","--.","....","..",".---",
+        "-.-",".-..","--","-.","---",".--.","--.-",".-.","...","-","..-","...-",".--","-..-","-.--","--.."};
+    static const char* d[10] = {"-----",".----","..---","...--","....-",".....","-....","--...","---..","----."};
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    if (c >= 'A' && c <= 'Z') return t[c - 'A'];
+    if (c >= '0' && c <= '9') return d[c - '0'];
+    return nullptr;
+}
+
+static void BuildInjectEnv() {
+    if (gInjectEnv) { free(gInjectEnv); gInjectEnv = nullptr; }
+    gInjectEnvLen = 0;
+    const char* call = gInjectCall[gInjectSegIdx];
+    static unsigned char u[4096];
+    int ulen = 0;
+    memset(u, 0, sizeof(u));
+    for (const char* p = call; *p; ++p) {
+        if (*p == ' ') { ulen += 7; continue; }
+        const char* m = MorseOf(*p);
+        if (!m) continue;
+        for (const char* q = m; *q; ++q) {
+            int n = (*q == '-') ? 3 : 1;
+            for (int i = 0; i < n && ulen < 4096; ++i) u[ulen++] = 1;
+            if (ulen < 4096) u[ulen++] = 0;          // 符号间隔 1 单位
+        }
+        for (int i = 0; i < 2 && ulen < 4096; ++i) u[ulen++] = 0;  // 字符间隔补到 3
+    }
+    for (int i = 0; i < 7 && ulen < 4096; ++i) u[ulen++] = 0;      // 报文尾 7 单位
+    if (ulen == 0) return;
+    double dot = (double)gSampleRate * 1.2 / (double)gInjectWpm;   // 点长（样本）
+    if (dot < 4.0) dot = 4.0;
+    gInjectEnvLen = (int)(ulen * dot);
+    gInjectEnv = (float*)calloc(gInjectEnvLen, sizeof(float));
+    if (!gInjectEnv) { gInjectEnvLen = 0; return; }
+    for (int i = 0; i < ulen; ++i) {
+        if (!u[i]) continue;
+        int s0 = (int)(i * dot), s1 = (int)((i + 1) * dot);
+        for (int s = s0; s < s1 && s < gInjectEnvLen; ++s) gInjectEnv[s] = 1.0f;
+    }
+    // 5 ms 斜坡，避免键控喀声
+    int ramp = (int)(gSampleRate * 0.005);
+    int s = 0;
+    while (s < gInjectEnvLen) {
+        if (gInjectEnv[s] > 0.5f) {
+            int e = s;
+            while (e < gInjectEnvLen && gInjectEnv[e] > 0.5f) ++e;
+            int r = ramp < (e - s) / 2 ? ramp : (e - s) / 2;
+            for (int k = 0; k < r; ++k) {
+                float w = (float)k / (float)r;
+                gInjectEnv[s + k] *= w;
+                gInjectEnv[e - 1 - k] *= w;
+            }
+            s = e;
+        } else ++s;
+    }
+}
+
+static void LoadInjectConfig() {
+    char dir[MAX_PATH], ini[MAX_PATH], buf[512];
+    gInjectOn = false;
+    gInjectCh = -1;
+    if (!GetSelfDir(dir)) return;
+    strcpy(ini, dir); strcat(ini, "\\RX888Intf.ini");
+    int sec = GetPrivateProfileIntA("RX888", "InjectSegSec", 0, ini);
+    buf[0] = 0;
+    GetPrivateProfileStringA("RX888", "InjectList", "", buf, sizeof(buf), ini);
+    if (sec <= 0 || buf[0] == 0) return;
+    static bool sArmedOnce = false;
+    if (sArmedOnce) return;
+    sArmedOnce = true;
+    int ch = GetPrivateProfileIntA("RX888", "InjectCh", -1, ini);
+    if (ch < 0 || ch >= gRecvCount) { LogI("Inject: bad ch %d (nCh=%d)", ch, gRecvCount); return; }
+    gInjectCh  = ch;
+    gInjectAmp = (float)GetPrivateProfileIntA("RX888", "InjectAmp", 3000, ini);
+    gInjectWpm = GetPrivateProfileIntA("RX888", "InjectWpm", 20, ini);
+    if (gInjectWpm < 5) gInjectWpm = 5;
+    gInjectNSeg = 0;
+    char* p = buf;
+    while (*p && gInjectNSeg < 8) {
+        while (*p == ' ' || *p == ',') ++p;
+        if (!*p) break;
+        gInjectAudio[gInjectNSeg] = atof(p);
+        while (*p && *p != ':') ++p;
+        if (*p == ':') ++p;
+        int n = 0;
+        while (*p && *p != ',' && n < 23) gInjectCall[gInjectNSeg][n++] = *p++;
+        gInjectCall[gInjectNSeg][n] = 0;
+        if (n > 0) ++gInjectNSeg;
+    }
+    if (gInjectNSeg == 0) return;
+    gInjectSegBlocks = (int)((double)sec * (double)gSampleRate / (double)gBlockInSamples);
+    if (gInjectSegBlocks < 1) gInjectSegBlocks = 1;
+    gInjectSegLeft = gInjectSegBlocks;
+    gInjectTotalLeft = gInjectSegBlocks * gInjectNSeg;
+    gInjectSegIdx = 0; gInjectPos = 0; gInjectPhase = 0.0;
+    BuildInjectEnv();
+    gInjectOn = (gInjectEnv != nullptr);
+    for (int k = 0; k < gInjectNSeg; ++k)
+        LogI("Inject: seg%d audio=%.0f Hz call=%s", k, gInjectAudio[k], gInjectCall[k]);
+    LogI("Inject armed: ch%d amp=%.0f wpm=%d segSec=%d segs=%d envLen=%d",
+         gInjectCh, gInjectAmp, gInjectWpm, sec, gInjectNSeg, gInjectEnvLen);
 }
 
 // ---------------------------------------------------------------------------
@@ -669,6 +881,65 @@ static DWORD WINAPI DeliverThread(LPVOID) {
         if (allFull) {
             CmplxA deliverArr[MAX_RX_COUNT];
             Cmplx** srcArr = (which == 0) ? gDataA : gDataB;
+            // v4.201: 合成 CW 注入（放在落盘之前，落盘即 SkimSrv 实际收到的内容）
+            if (gInjectOn && gInjectCh >= 0 && gInjectEnv && gInjectEnvLen > 0) {
+                Cmplx* ib = srcArr[gInjectCh];
+                // v4.207: 交付速率回到精确 192000（12/125），注入相位直接按 gSampleRate 换算
+                const double fsReal = (double)gSampleRate;
+                double inc = 6.283185307179586 * gInjectAudio[gInjectSegIdx] / fsReal;
+                for (int s = 0; s < gBlockInSamples; ++s) {
+                    float e = gInjectEnv[gInjectPos];
+                    if (e != 0.0f) {
+                        float c = (float)cos(gInjectPhase), sn = (float)sin(gInjectPhase);
+                        ib[s].Re += gInjectAmp * e * c;
+                        ib[s].Im += gInjectAmp * e * sn;
+                    }
+                    gInjectPhase += inc;
+                    if (gInjectPhase > 6.283185307179586) gInjectPhase -= 6.283185307179586;
+                    if (++gInjectPos >= gInjectEnvLen) gInjectPos = 0;
+                }
+                if (--gInjectSegLeft <= 0) {
+                    gInjectSegIdx = (gInjectSegIdx + 1) % gInjectNSeg;
+                    gInjectSegLeft = gInjectSegBlocks;
+                    gInjectPos = 0;
+                    BuildInjectEnv();
+                    LogI("Inject: -> seg%d audio=%.0f Hz call=%s",
+                         gInjectSegIdx, gInjectAudio[gInjectSegIdx], gInjectCall[gInjectSegIdx]);
+                }
+                if (--gInjectTotalLeft <= 0) {
+                    gInjectOn = false;
+                    LogI("Inject: sequence complete, injection off");
+                }
+            }
+            // v4.199: IQ 落盘——必须在 pIQProc 之前抓取，回调可能改写指针数组条目
+            if (gIqDumpBlocksLeft > 0 && gIqDumpNCh > 0) {
+                for (int k = 0; k < gIqDumpNCh; ++k) {
+                    FILE* fp = gIqDumpFiles[k];
+                    if (fp)
+                        fwrite(srcArr[gIqDumpChans[k]], sizeof(Cmplx),
+                               (size_t)gBlockInSamples, fp);
+                }
+                if (--gIqDumpBlocksLeft == 0) {
+                    for (int k = 0; k < gIqDumpNCh; ++k) {
+                        if (gIqDumpFiles[k]) { fclose(gIqDumpFiles[k]); gIqDumpFiles[k] = nullptr; }
+                    }
+                    LogI("IQDump: complete (%lld blocks captured)", gIqDumpBlocksTotal);
+                    // 恢复被改写过 LO 的通道
+                    int nrestore = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(gRetuneMtx);
+                        for (int k = 0; k < gIqDumpNCh; ++k) {
+                            int ch = gIqDumpChans[k];
+                            if (gIqDumpLoList[k] > 0) {
+                                gPendingRetunes.emplace_back(ch, gLoHz[ch]);
+                                ++nrestore;
+                            }
+                        }
+                    }
+                    if (nrestore > 0)
+                        LogI("IQDump: LO restored on %d channel(s)", nrestore);
+                }
+            }
             for (int c = 0; c < gRecvCount; ++c)
                 deliverArr[c] = srcArr[c];
             CmplxA* deliver = deliverArr;
@@ -718,15 +989,25 @@ static DWORD WINAPI DeliverThread(LPVOID) {
 
         // 周期性统计（每 1000 块 ≈ 1.02 秒）+ v4.187-10 QPC 插桩汇总
         if ((usbBlocks % 1000) == 0) {
-            double sec = usbBlocks * (double)n / (double)ADC_FREQ;
-            LogI("stat usb=%llu dsp=%llu deliver=%llu (%.1f blocks/s) delivered=%lu",
-                (unsigned long long)usbBlocks, (unsigned long long)dspCalls,
-                (unsigned long long)deliverCalls,
-                deliverCalls / sec, gBlocksDelivered);
             QueryPerformanceCounter(&qpcNow);
             uint64_t wallUs = (uint64_t)((qpcNow.QuadPart - qpcWall0.QuadPart) * qpcInv);
             tStat += (uint64_t)((qpcNow.QuadPart - qpcPrev.QuadPart) * qpcInv);
             qpcPrev = qpcNow;
+
+            // v4.199: 墙钟实测吞吐。旧公式 sec = usbBlocks*n/ADC_FREQ 是拿标称
+            //   64M 反算时间，恒得 976.6 blocks/s——实时率亏损在这条线上永远
+            //   看不见（ddc_engine.h 已把它记为"stat 公式假象"）。
+            //   effRate 才是每秒真正吃进的 64M 域样本数；低于标称的缺口就是
+            //   USB 侧静默丢样比例，会按 1:1 变成音频轴比例误差（频率读高）。
+            double wallSec = (double)wallUs * 1e-6;
+            double reqBps  = (double)ADC_FREQ / (double)n;                 // 976.5625
+            double effBps  = (wallSec > 0.0) ? (1000.0 / wallSec) : 0.0;
+            double effRate = effBps * (double)n;
+            double ppm     = (reqBps > 0.0) ? (effBps / reqBps - 1.0) * 1e6 : 0.0;
+            LogI("stat usb=%llu dsp=%llu deliver=%llu wall=%.3fs effBps=%.2f reqBps=%.2f effRate=%.0f ppm=%+.0f ringFull=%d",
+                (unsigned long long)usbBlocks, (unsigned long long)dspCalls,
+                (unsigned long long)deliverCalls, wallSec, effBps, reqBps,
+                effRate, ppm, UsbRingFullCount(gRing));
             if (++qpcSampleCount >= 2) {   // 首个千块窗口跳过（含启动预热）
                 uint64_t loopSum = tPreFetch + tApplyRe + tCollect + tWait + tFlip
                                  + tRetune + tSwap + tSubmit + tDeliver + tStat;
@@ -757,6 +1038,7 @@ static DWORD WINAPI DeliverThread(LPVOID) {
     LogI("DDC pool shutdown done (" RX888INTF_VERSION ")");
 
     gDspReady = false;
+    CloseIqDump();
     // v4.177: MinGW 32 位下 delete DDC_Engine 崩溃（与 ringbuffer/CyAPI 同类问题），
     //   采用泄漏策略——StopRx 不频繁，泄漏量可控
     Log("deliver thread: skip delete eng (MinGW32 leak policy)");
@@ -832,6 +1114,11 @@ void __stdcall StartRx(void* rawParams) {
     if (gRecvCount > MAX_RX_COUNT) gRecvCount = MAX_RX_COUNT;
     Log("StartRx: clamped RecvCount=%d, blockInSamples=%d, sampleRate=%d",
         gRecvCount, gBlockInSamples, gSampleRate);
+
+    // v4.199: IQ 落盘探针（依赖上面已确定的 gRecvCount / 速率 / 块长）
+    LoadIqDumpConfig();
+    // v4.201: 合成 CW 注入探针（同上依赖）
+    LoadInjectConfig();
 
     if (!gSet.pIQProc) {
         Log("StartRx: pIQProc NULL, refuse");
@@ -1135,6 +1422,7 @@ void __stdcall StopRx(void) {
         }
         CloseHandle(gThread); gThread = nullptr;
     }
+    CloseIqDump();   // v4.199: 线程被强杀时释放落盘句柄
     Log("StopRx: step3 UsbFreeRing begin");
     gRunning = false;
     UsbFreeRing(&gRing);                  // 交付线程已退出，安全释放
@@ -1159,13 +1447,25 @@ void __stdcall SetRxFrequency(int Frequency, int Receiver) {
     Log("SetRxFrequency f=%d rx=%d", Frequency, Receiver);
     if (Receiver < 0 || Receiver >= gRecvCount) return;
     double lo = ClampLo(Frequency);
+    // v4.199/v4.200: 落盘采集期间，把被采通道临时改到各自指定的 LO（绝对参考）
+    double loUse = lo;
+    if (gIqDumpBlocksLeft > 0) {
+        for (int k = 0; k < gIqDumpNCh; ++k) {
+            if (gIqDumpChans[k] == Receiver && gIqDumpLoList[k] > 0) {
+                loUse = gIqDumpLoList[k];
+                break;
+            }
+        }
+    }
     gLoHz[Receiver] = lo;
     gLoSet[Receiver] = true;
     // 热重调：写入待处理队列，由交付线程在循环边界消费（串行化后无锁安全）
     {
         std::lock_guard<std::mutex> lk(gRetuneMtx);
-        gPendingRetunes.emplace_back(Receiver, lo);
+        gPendingRetunes.emplace_back(Receiver, loUse);
     }
+    if (loUse != lo)
+        LogI("IQDump: rx%d LO overridden %.0f -> %.0f Hz (ref)", Receiver, lo, loUse);
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,7 +1488,7 @@ int __stdcall ReadPort(int PortNumber) {
 // ---------------------------------------------------------------------------
 // DLL 入口：进程/线程附加分离（SkimSrv 为单进程多线程）
 // ---------------------------------------------------------------------------
-BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpReserved) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
             DisableThreadLibraryCalls(hInst);
@@ -1213,7 +1513,16 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID) {
             }
             break;
         case DLL_PROCESS_DETACH:
-            if (gStarted) StopRx();
+            // v4.204: 进程终止时绝不能走 StopRx——它最多 join 15 s 且可能死锁，
+            //   这正是"程序退出后进程残留"的原因。进程已在退出，资源由 OS 回收，
+            //   这里只需把 FX3 停流，避免 DMA 卡死到下次启动。
+            if (gStarted) {
+                if (lpReserved == nullptr) {
+                    StopRx();               // FreeLibrary 主动卸载：完整收尾
+                } else {
+                    UsbEmergencyStop();     // 进程终止：只发 STOPFX3，不 join
+                }
+            }
             LogClose();
             break;
     }

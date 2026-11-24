@@ -70,6 +70,8 @@ public:
  	// thread hung forever inside CyAPI CreateFile (kernel PnP lock) when the
  	// FX3 was half-dead, leaving the skimmer deaf with no alarm.
  	bool UsbDevicePresent(); // pre-check: any Cypress (VID_04B4) device on the bus?
+	// v4.205: 软件复位——让设备节点重新枚举（等效拔插 USB 线）。
+	bool SoftwareReplug();
  	bool Enumerate(unsigned char &idx, char *lbuf);
 private:
 	bool SendI2cbytes(uint8_t i2caddr, uint8_t regaddr, uint8_t* pdata, uint8_t len);
@@ -100,6 +102,8 @@ private:
 	bool Close(void);
 public:
 	void AdcSamplesProcess();   // v4.176: public for Win32 thunk access
+	// v4.206: usb_shim 收尾入口——停流(STOPFX3)并关闭设备句柄
+	void CloseFromHost() { Close(); }
 private:
 
 	ringbuffer<int16_t> *inputbuffer;

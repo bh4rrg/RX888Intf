@@ -236,8 +236,8 @@ private:
 // v4.194 消灭原位惩罚（本会话 pipeline_bench 双机实测驱动，见 daily-log）：
 //   v4.193 的 576 样本双倍延迟线需把输入按 R 组 memcpy 进来才读，FIR 读到的
 //   最新 32 样本是几 µs 前刚写入的（store-to-load 转发/新鲜数据读惩罚），
-//   8559U 8T 实测 mixdec=347.7µs vs split（先写完再算）=244.2µs，惩罚 ~104µs/块
-//   占 full 的 27%；AVX2 加宽向量在 8559U 反而 2.4 倍负优化，路线堵死。
+//   NUC 8T 实测 mixdec=347.7µs vs split（先写完再算）=244.2µs，惩罚 ~104µs/块
+//   占 full 的 27%；AVX2 加宽向量在 NUC 反而 2.4 倍负优化，路线堵死。
 //   v4.194 直读方案：FIR 窗口跨块回看仅 N-R 样本（N=288, R=32），用独立
 //   tail_ 缓冲保存逻辑流最后 N-1 样本（块末一次 memcpy，距下次读取隔一个
 //   块周期，数据已冷），主路径 FIR 直接在输入大数组上做窗口内积，
@@ -305,7 +305,7 @@ public:
     // 实 ADC 输入批量处理：每 R 个输入产生 1 个复输出
     // v4.194 直读版：FIR 窗口直接在输入大数组上滑动做内积，消灭 v4.193 的
     //   "按 R 组 memcpy 进 576 样本延迟线"（原位惩罚根因：FIR 读到 5µs 前刚
-    //   memcpy 的最新 32 样本，store-to-load 转发/新鲜数据读惩罚，8559U 8T 实测
+    //   memcpy 的最新 32 样本，store-to-load 转发/新鲜数据读惩罚，NUC 8T 实测
     //   mixdec 段 347.7µs vs split 244.2µs，惩罚占 full 的 27%）。
     // 节拍语义（与 v4.193 延迟线版逐点对齐）：
     //   ①每消费第 R 个逻辑样本发射一次（kToNext_ 跨调用连续，自动继承截断风暴
@@ -526,7 +526,7 @@ public:
                 const float* base = dI + w_ - 1 - (long)dist;   // 指向 x[b]（最新→回退）
                 const float* baseQ = dQ + w_ - 1 - (long)dist;
                 const float* ph = &poly_[(size_t)r * K];
-                // v4.193: 4 路部分和打破 FMA 串行依赖链（8559U 8 线程实测 -47%）
+                // v4.193: 4 路部分和打破 FMA 串行依赖链（NUC 8 线程实测 -47%）
                 // x[b-k]：b 往回 k 步。基址向回走 → 负步长线性访问（容量 2cap 保证线性）
                 // 注意 b-k ≥ total_-cap+... 由延迟线深度保证（K ≤ cap）
                 float aI0 = 0.f, aI1 = 0.f, aI2 = 0.f, aI3 = 0.f;

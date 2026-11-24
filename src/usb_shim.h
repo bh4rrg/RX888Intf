@@ -35,6 +35,14 @@ void* UsbPeekReadPtr(void* ring);
 // 消费完成，推进读指针
 void UsbReadDone(void* ring);
 
+// v4.199: 环形缓冲"写端因满而等待"的累计次数——非零说明消费速度追不上
+// USB 生产速度（实时率亏损），此时上游 FX3 缓冲溢出会静默丢样。
+int UsbRingFullCount(void* ring);
+
+// v4.204: 只发 STOPFX3，不 join 任何线程、不做阻塞等待。
+// 仅供 DLL_PROCESS_DETACH 使用（进程已在退出，禁止长时间阻塞）。
+void UsbEmergencyStop(void);
+
 #ifdef __cplusplus
 }
 #endif

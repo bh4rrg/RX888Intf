@@ -183,8 +183,12 @@ void UsbClose(void** dev) {
     // 析构器 throw + USB 句柄释放时序问题）。改为仅 Close() 并泄漏对象。
     // StopRx 不频繁，泄漏可接受；根治需重写 CyAPI 析构或换用 WinUSB。
     if (gDev) {
-        // gDev->Close() 已在 StopStream/StopRx 流程中间接完成（fx3dev->Close）；
-        // 此处不再调用 delete，仅置 nullptr 释放 DLL 侧引用。
+        // v4.206: 必须真正走一次 Close()——它会先发 STOPFX3 停流再释放句柄。
+        //   此前这里只置空指针，StopStream() 只停采集线程、不停 FX3，
+        //   于是退出后固件继续向死端点推数据，下次打开时 DMA 卡死，
+        //   表现为“重启后无数据、只能物理拔插”。
+        gDev->CloseFromHost();
+        // 仍然不 delete：MinGW32 下 fx3handler 对象整体析构不安全，只泄漏对象。
         gDev = nullptr;
     }
     *dev = nullptr;
@@ -210,6 +214,13 @@ void UsbStopStream(void* dev, void* ring) {
     UsbLog("UsbStopStream: done");
 }
 
+// v4.204: 进程退出路径专用——只发 STOPFX3，不 join、不等待。
+void UsbEmergencyStop(void) {
+    if (!gDev) return;
+    UsbLog("UsbEmergencyStop: STOPFX3 (no joins)");
+    gDev->Control(STOPFX3);
+}
+
 void UsbFreeRing(void** ring) {
     UsbLog("UsbFreeRing: begin");
     if (ring && *ring) {
@@ -232,4 +243,9 @@ void* UsbPeekReadPtr(void* ring) {
 
 void UsbReadDone(void* ring) {
     if (ring) static_cast<ringbuffer<int16_t>*>(ring)->ReadDone();
+}
+
+int UsbRingFullCount(void* ring) {
+    if (!ring) return 0;
+    return static_cast<ringbuffer<int16_t>*>(ring)->getFullCount();
 }

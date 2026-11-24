@@ -61,7 +61,7 @@ inline void DbgPrintfForceToFile(const char *fmt, ...) {
 
 // v4.198: 接口版本单一真源——所有落盘/横幅中的版本号一律引用此宏，
 // 杜绝 FX3handler.cpp EXHAUSTED 横幅硬编码 (v4.195) 致版本误判（11-09 事故）
-#define RX888INTF_VERSION      "v4.198"
+#define RX888INTF_VERSION      "v4.208"
 
 #define SWVERSION           "1.3.0 RC1"	  
 #define SETTINGS_IDENTIFIER	"sddc_1.06"

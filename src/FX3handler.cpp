@@ -9,6 +9,7 @@
 // 
 #include <windows.h>
 #include <setupapi.h>   // v4.195: UsbDevicePresent bus pre-check
+#include <cfgmgr32.h>   // v4.205: CM_Reenumerate_DevNode 软件复位
 #include <string.h>
 #include "config.h"
 #include "FX3handler.h"
@@ -33,6 +34,32 @@
 // Which firmware the streamer is running. Set in Open() from the USB device
 // name ('FX3' = RX666.img firmware, 'SDR' = RX888-family firmware).
 static bool gFwIsRx666 = false;
+
+// v4.208: 硬件型号显式配置 —— [RX888] HwModel: 1=RX888（默认）2=RX666。
+//   旧逻辑用"目录里有没有 RX666.img"决定下载哪份固件，与硬件无关：
+//   RX888 目录里只要躺着 RX666.img，每次上电就被刷成 RX666 固件，
+//   随后 name='FX3' 又被当成硬件身份，施加 RX666 的 GPIO/GPIF 配置。
+//   固件选择必须由硬件身份决定，文件存在性不得覆盖配置。
+#define HW_MODEL_RX888 1
+#define HW_MODEL_RX666 2
+static int gHwModel = -1;   // -1=未读
+
+static int GetHwModel()
+{
+	if (gHwModel >= 0) return gHwModel;
+	gHwModel = HW_MODEL_RX888;
+	char path[MAX_PATH];
+	DWORD n = GetModuleFileNameA(nullptr, path, MAX_PATH);
+	if (n > 0 && n < MAX_PATH) {
+		char* slash = strrchr(path, '\\');
+		if (slash) {
+			strcpy(slash + 1, "RX888Intf.ini");
+			int m = GetPrivateProfileIntA("RX888", "HwModel", HW_MODEL_RX888, path);
+			gHwModel = (m == HW_MODEL_RX666) ? HW_MODEL_RX666 : HW_MODEL_RX888;
+		}
+	}
+	return gHwModel;
+}
 
 // ============================================================================
 // v4.195 guarded-reopen ownership protocol (the 10-27 fix). READ BEFORE TOUCHING.
@@ -176,7 +203,10 @@ bool fx3handler::Enumerate(unsigned char& idx, char* lbuf)
 		bool imgExists = (imgAttr != INVALID_FILE_ATTRIBUTES);
 		DbgPrintf("Enumerate: RX666.img probe %s (%s)\n", imgExists ? "FOUND" : "absent", imgPath);
 
-		if (!bootNow && imgExists &&
+		// v4.208: 这一段只对 HwModel=RX666 生效。RX888 硬件上即使 TESTFX3
+		//   Model=0，也绝不能拿 RX666.img 去顶替——旧逻辑会把它刷成
+		//   RX666 固件，正是本机故障的成因。
+		if (!bootNow && imgExists && GetHwModel() == HW_MODEL_RX666 &&
 			strcmp(fx3dev->DeviceName, "SDR") == 0)
 		{
 			// RX888-build firmware running. Read Model to see if it recognized
@@ -213,31 +243,38 @@ bool fx3handler::Enumerate(unsigned char& idx, char* lbuf)
 		}
 
 		if (fx3dev->IsOpen() && fx3dev->IsBootLoaderRunning()) {
-			// v4.172: bootloader state — prefer local RX666.img, fallback to built-in.
+			// v4.208: 下载哪份固件由 HwModel 决定（旧逻辑看文件是否存在）。
 			const UCHAR* fwData = firmware_data;
 			UINT fwSize = (UINT)firmware_size;
-			const char* fwName = "built-in SDDC_FX3.img";
-			if (imgExists) {
-				FILE* f = fopen(imgPath, "rb");
-				if (f) {
-					static unsigned char imgBuf[262144];
-					size_t got = fread(imgBuf, 1, sizeof(imgBuf), f);
-					fclose(f);
-					if (got > 0 && got <= sizeof(imgBuf)) {
-						fwData = imgBuf;
-						fwSize = (UINT)got;
-						fwName = "RX666.img";
+			const char* fwName = "built-in SDDC_FX3.img (RX888)";
+			if (GetHwModel() == HW_MODEL_RX666) {
+				if (imgExists) {
+					FILE* f = fopen(imgPath, "rb");
+					if (f) {
+						static unsigned char imgBuf[262144];
+						size_t got = fread(imgBuf, 1, sizeof(imgBuf), f);
+						fclose(f);
+						if (got > 0 && got <= sizeof(imgBuf)) {
+							fwData = imgBuf;
+							fwSize = (UINT)got;
+							fwName = "RX666.img";
+						}
 					}
+					DbgPrintf("Enumerate: bootloader - HwModel=RX666, using %s (%u bytes)\n", fwName, fwSize);
 				}
-				DbgPrintf("Enumerate: bootloader - using %s (%u bytes)\n", fwName, fwSize);
+				// HwModel=RX666 时缺 img：绝不能把内置 RX888 固件刷进 RX666 硬件
+				// 制造 'SDR' 僵死态。报警、跳过下载、本次 Enumerate 失败。
+				else {
+					DbgPrintf("Enumerate: *** HwModel=RX666 but RX666.img MISSING (%s) - refusing "
+						"built-in RX888 firmware to avoid 'SDR' zombie state. "
+						"Copy RX666.img next to the DLL/exe and replug. ***\n", imgPath);
+					imgMissingAlarm = true;
+				}
 			}
-			// v4.189: img 不在（或读到 0 字节）——绝不能把内置 RX888 固件刷进
-			// RX666 硬件制造 'SDR' 僵死态。报警、跳过下载、本次 Enumerate 失败。
 			else {
-				DbgPrintf("Enumerate: *** RX666.img MISSING (%s) - refusing built-in "
-					"RX888 firmware fallback to avoid 'SDR' zombie state. "
-					"Copy RX666.img next to the DLL/exe and replug. ***\n", imgPath);
-				imgMissingAlarm = true;
+				// HwModel=RX888：一律用内置 SDDC_FX3.img，目录里的 RX666.img 一律忽略。
+				DbgPrintf("Enumerate: bootloader - HwModel=RX888, using %s (%u bytes)%s\n",
+					fwName, fwSize, imgExists ? " [RX666.img present but IGNORED]" : "");
 			}
 			if (!imgMissingAlarm && fx3dev->DownloadFwToRam(fwData, fwSize) != SUCCESS) {
 				DbgPrintf("Failed to DownloadFwToRam device(%x)\n", idx);
@@ -314,6 +351,64 @@ bool fx3handler::UsbDevicePresent()
 	return present;
 }
 
+// v4.205: 软件复位。让设备节点重新枚举，等效于物理拔插 USB 线。
+// 仅在恢复预算耗尽后调用一次；成功后固件会重新加载，调用方再重新打开。
+bool fx3handler::SoftwareReplug() {
+	HDEVINFO hDevInfo = SetupDiGetClassDevsA(nullptr, "USB", nullptr,
+		DIGCF_PRESENT | DIGCF_ALLCLASSES);
+	if (hDevInfo == INVALID_HANDLE_VALUE) {
+		DbgPrintf("SoftwareReplug: SetupDiGetClassDevs failed (%lu)\n", GetLastError());
+		return false;
+	}
+	bool ok = false;
+	SP_DEVINFO_DATA di;
+	di.cbSize = sizeof(di);
+	for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo, i, &di); i++) {
+		char devId[256];
+		DWORD sz = 0;
+		if (!SetupDiGetDeviceInstanceIdA(hDevInfo, &di, devId, sizeof(devId), &sz))
+			continue;
+		if (strncmp(devId, "USB\\VID_04B4", 12) != 0)
+			continue;
+		DEVINST devInst = 0;
+		CONFIGRET cr = CM_Locate_DevNodeA(&devInst, devId, CM_LOCATE_DEVNODE_NORMAL);
+		if (cr != CR_SUCCESS) {
+			DbgPrintf("SoftwareReplug: CM_Locate_DevNode failed 0x%lx\n", (unsigned long)cr);
+			break;
+		}
+		DbgPrintf("SoftwareReplug: re-enumerating %s\n", devId);
+		cr = CM_Reenumerate_DevNode(devInst, CM_REENUMERATE_SYNCHRONOUS);
+		DbgPrintf("SoftwareReplug: CM_Reenumerate_DevNode -> 0x%lx\n", (unsigned long)cr);
+		ok = (cr == CR_SUCCESS);
+		if (!ok) {
+			// v4.206: 回退到 SetupAPI 设备重启（等效“禁用/启用设备”）。
+			//   实测 CM_Reenumerate_DevNode 在本机返回 0x33 (CR_NO_CM_SERVICES)。
+			SP_PROPCHANGE_PARAMS pcp;
+			ZeroMemory(&pcp, sizeof(pcp));
+			pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+			pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+			pcp.StateChange = DICS_PROPCHANGE;
+			pcp.Scope = DICS_FLAG_GLOBAL;
+			pcp.HwProfile = 0;
+			if (SetupDiSetClassInstallParamsA(hDevInfo, &di,
+					&pcp.ClassInstallHeader, sizeof(pcp)) &&
+				SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, hDevInfo, &di)) {
+				DbgPrintf("SoftwareReplug: DIF_PROPERTYCHANGE ok\n");
+				ok = true;
+			} else {
+				DbgPrintf("SoftwareReplug: DIF_PROPERTYCHANGE failed (%lu)\n", GetLastError());
+			}
+		}
+		break;
+	}
+	SetupDiDestroyDeviceInfoList(hDevInfo);
+	if (ok) {
+		DbgPrintf("SoftwareReplug: waiting for firmware reload\n");
+		Sleep(3000);
+	}
+	return ok;
+}
+
 bool  fx3handler::Open() {
 	bool r = false;
 
@@ -329,8 +424,15 @@ bool  fx3handler::Open() {
 	// v4.173: remember which firmware is running (name is decisive, see
 	// Enumerate() notes: 'FX3' = RX666 fw, 'SDR' = RX888-family fw).
 	gFwIsRx666 = (strcmp(fx3dev->DeviceName, "FX3") == 0);
-	DbgPrintf("Open: device name='%s' -> command set %s\n",
-		fx3dev->DeviceName, gFwIsRx666 ? "RX666 (GPIO=0xBC)" : "RX888-family (GPIO=0xAD)");
+	DbgPrintf("Open: device name='%s' -> command set %s (HwModel=%s)\n",
+		fx3dev->DeviceName, gFwIsRx666 ? "RX666 (GPIO=0xBC)" : "RX888-family (GPIO=0xAD)",
+		GetHwModel() == HW_MODEL_RX666 ? "RX666" : "RX888");
+	// v4.208: 配置与实跑固件不一致 → 强制告警（正常路径不会走到这里）。
+	if (GetHwModel() == HW_MODEL_RX888 && gFwIsRx666) {
+		DbgPrintfForce("[SDDC] *** WARNING: HwModel=RX888 but firmware is RX666 build ('FX3'). "
+			"Front-end GPIO (0xBC protocol) and GPIF timing are wrong for this hardware. "
+			"Power-cycle so the driver can load the built-in RX888 firmware. ***\n");
+	}
 	EndPt = fx3dev->BulkInEndPt;
 	if (!EndPt) {
 		DbgPrintf("No Bulk In end point\n");
@@ -552,6 +654,14 @@ bool fx3handler::Close() {
 	// v4.195: release a guard left behind by a timed-out ReopenWatchdog
 	// BEFORE closing our own device state (keeps who-allocates-deletes).
 	wdTeardownStrayGuard();
+	// v4.203: 正常关闭也必须先停流。此前只有恢复路径发 STOPFX3，
+	//   直接退出时 FX3 仍在向即将关闭的端点推送，快速重启会让 DMA 卡死，
+	//   表现为下次启动 WaitForXfer 超时、只能物理拔插。
+	if (fx3dev && Fx3IsOn) {
+		DbgPrintf("Close: sending STOPFX3 before exit\n");
+		Control(STOPFX3);
+		Sleep(50);
+	}
 	if (fx3dev) {               // v4.195: null-safe (fx3dev may be null after
 		fx3dev->Close();        // a watchdog timeout: ownership passed to guard)
 		delete fx3dev;
@@ -919,6 +1029,7 @@ void fx3handler::AdcSamplesProcess()
 	int recoverCount = 0;   // v4.174: attempts used of the current budget
 	unsigned long lastRecoverTick = 0;  // v4.195: GetTickCount of last recovery end
 	bool recoveryFirstAttempt = true;   // v4.195: true until first recovery in this incident
+	bool replugTried = false;           // v4.205: 本次运行是否已尝试软件复位
 	while (run) {
  		if (!FinishDataXfer(&contexts[read_idx])) {
  			// v4.174: auto-recovery instead of immediate break.
@@ -932,11 +1043,30 @@ void fx3handler::AdcSamplesProcess()
  			// If all attempts fail, the thread exits with a loud alarm
  			// block (was: silent exit, skimmer died without a trace).
 			if (recoverCount >= USB_MAX_RECOVER) {
+				// v4.205: 预算耗尽时先试软件复位（重新枚举设备节点）。
+				//   固件半死状态下 STOPFX3/STARTFX3 都无效，重新枚举能让
+				//   固件重新加载，从而免去物理拔插。成功则重置预算继续走
+				//   下面的清理/重开/启动流程。
+				if (!replugTried && SoftwareReplug()) {
+					replugTried = true;
+					DbgPrintfForce("[SDDC] Software replug OK - retrying open/start\n");
+					recoverCount = 0;
+				}
+			}
+			if (recoverCount >= USB_MAX_RECOVER) {
 				DbgPrintfForce("\n");
 				DbgPrintfForce("======================================================================\n");
 				DbgPrintfForce("  USB RECOVERY EXHAUSTED after %d attempts (" RX888INTF_VERSION ")\n", recoverCount);
-				DbgPrintfForce("  Root cause: firmware DMA / USB pipe hard-dead (CRC errors,\n");
-				DbgPrintfForce("  10-27 incident signature). RX666 firmware has no software reset.\n");
+				DbgPrintfForce("  Root cause: firmware DMA / USB pipe hard-dead (CRC errors).\n");
+				// v4.208: 按实跑固件报，不再硬编码 RX666（本机曾因此误判硬件）。
+				if (gFwIsRx666) {
+					DbgPrintfForce("  Running RX666 firmware ('FX3'), HwModel=%s. RX666 firmware has\n",
+						GetHwModel() == HW_MODEL_RX666 ? "RX666" : "RX888");
+					DbgPrintfForce("  no RESETFX3 support, so no software reset is possible.\n");
+				} else {
+					DbgPrintfForce("  Running RX888 firmware ('SDR'), HwModel=%s.\n",
+						GetHwModel() == HW_MODEL_RX666 ? "RX666" : "RX888");
+				}
 				DbgPrintfForce("  ACTION REQUIRED: unplug+replug the USB cable, then restart\n");
 				DbgPrintfForce("  SkimSrv. The ADC thread is stopping NOW to avoid writing a\n");
 				DbgPrintfForce("  half-dead stream into the DSP.\n");

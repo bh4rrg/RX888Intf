@@ -4,8 +4,8 @@ REM  RX888Intf.dll build script (v4.191+)
 REM  IRON RULE (v4.193): -march=x86-64-v3 -ffast-math are MANDATORY.
 REM  -ffast-math: GCC strict FP forbids reduction vectorization;
 REM    losing it causes 8x regression (vfmadd/AVX2 -> x87 fmul/faddp).
-REM  -march=x86-64-v3: AVX2+FMA standard baseline (Ryzen 3700X and mobile
-REM    Core i7-8559U both support). Replaces -march=native (v4.192): znver2 tuning was
+REM  -march=x86-64-v3: AVX2+FMA standard baseline (3700X and NUC 8559U
+REM    both support). Replaces -march=native (v4.192): znver2 tuning was
 REM    34% SLOWER than v3 on 3700X in firbench, and native tied the DLL
 REM    to one microarch (fragile cross-vendor deployment).
 REM  Usage: build.bat [output.dll]   default: RX888New_o3_fast.dll
@@ -24,7 +24,7 @@ if errorlevel 1 (
 )
 
 echo [BUILD] %OUT%  (-O3 -march=x86-64-v3 -ffast-math)
-g++.exe -shared -O3 -march=x86-64-v3 -ffast-math -o %OUT% skimsrv_intf.cpp usb_shim.cpp FX3handler.cpp CyAPI.cpp RX888New.def -static-libgcc -static-libstdc++ -lsetupapi -lwinmm -lpsapi
+g++.exe -shared -O3 -march=x86-64-v3 -ffast-math -o %OUT% skimsrv_intf.cpp usb_shim.cpp FX3handler.cpp CyAPI.cpp RX888New.def -static-libgcc -static-libstdc++ -lsetupapi -lcfgmgr32 -lwinmm -lpsapi
 if errorlevel 1 (
   echo [ERROR] build FAILED
   exit /b 1
@@ -33,5 +33,5 @@ if errorlevel 1 (
 echo [OK] built %OUT%
 for %%F in (%OUT%) do echo [SIZE] %%~zF bytes
 echo.
-echo [HINT] verify SIMD: objdump -d -M intel %OUT% ^| findstr /c:"vfmadd"  (must be ^>0 in WorkerTramp; x87 fmul/faddp should be ~0)
+echo [HINT] verify SIMD: objdump -d -M intel %OUT% ^| findstr /c:"vfmadd"  (must be >0 in WorkerTramp; x87 fmul/faddp should be ~0)
 endlocal

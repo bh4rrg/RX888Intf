@@ -1,8 +1,8 @@
 // ddc_engine.h v3 - 高速多通道 DDC 引擎（用于新 RX888 SkimSrv 驱动）
 // v4.196：waitBatch 混合同步（短自旋 + WaitAll doneEv_）——CDC 归因（2026-11-06，
-//   实机 QPC 263 样本）：主线程 wait 段 332µs/块为纯自旋烧核（主线程唯一真实烧核
+//   NUC QPC 263 样本）：主线程 wait 段 332µs/块为纯自旋烧核（主线程唯一真实烧核
 //   等待点，prefetch 段在 ringbuffer 内早已是 CV 休眠）。改为短自旋覆盖快路径后
-//   落内核事件，预期整机进程 CPU 60% → ~57%。worker 完成处新增 SetEvent(doneEv_)。
+//   落内核事件，预期 NUC 进程 CPU 60% → ~57%。worker 完成处新增 SetEvent(doneEv_)。
 // v3.1（v4.190）：DDC_Engine 增加 shutdownPool()——退出路径必须显式关闭
 //   worker 线程池。引擎按 MinGW32 泄漏策略不 delete，析构永远不执行；
 //   交付线程被 TerminateThread 后无人能再 shutdown，worker 存活至 DLL
@@ -157,12 +157,12 @@ public:
         // 不等待，立即返回——主线程去做重叠工作
     }
 
-    // v4.196: 混合同步——短自旋（快路径零内核开销：实机实测 wait 仅 ~1.2µs/批，
+    // v4.196: 混合同步——短自旋（快路径零内核开销：3700X 实测 wait 仅 ~1.2µs/批，
     // 2 万次轻读自旋 ≈ 100µs 窗口完全覆盖）→ 未完成则 WaitForMultipleObjects
     // WaitAll 等 batchN_ 个 manual-reset doneEv_（慢路径内核休眠）。CDC 归因
-    //（2026-11-06 实机 QPC 263 样本）：wait 段 332µs/块为纯自旋烧核，是主线程
+    //（2026-11-06 NUC QPC 263 样本）：wait 段 332µs/块为纯自旋烧核，是主线程
     // 唯一真实烧核等待点（prefetch 段在 ringbuffer 内早已是 CV 休眠）；本改动
-    // 预期整机进程 CPU 60% → ~57%。唤醒延迟 ~10-50µs << 1.024ms 块周期，
+    // 预期 NUC 进程 CPU 60% → ~57%。唤醒延迟 ~10-50µs << 1.024ms 块周期，
     // 且 prefetch 段还有 ~565µs USB 等待缓冲，实时性无损。
     // 事件序：worker 先写 doneEpoch_ 后 SetEvent（锁前缀 + 内核调用双重栅栏），
     // 主线程见事件置位则 epoch 必可见；WAIT_TIMEOUT/提前返回后一律回查 epoch
@@ -315,6 +315,9 @@ public:
             switch (rate_) {
                 case RATE_48K:  L = 3;  M = 125; break;
                 case RATE_96K:  L = 6;  M = 125; break;
+                // v4.207: 恢复 12/125 = 精确 192000。Qs1rIntf.dll 已移出枚举目录，
+                //   SkimSrv 的 skimmer.rate 回到本驱动 GetSdrInfo 报的 192000；
+                //   v4.202 的 5/52 (192307.69) 会使音频轴产生 -1602.5ppm 比例偏差
                 case RATE_192K: L = 12; M = 125; break;
                 default:        L = 6;  M = 125; break;
             }
