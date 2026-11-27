@@ -72,6 +72,27 @@ public:
  	bool UsbDevicePresent(); // pre-check: any Cypress (VID_04B4) device on the bus?
 	// v4.205: 软件复位——让设备节点重新枚举（等效拔插 USB 线）。
 	bool SoftwareReplug();
+	// v4.209: 设备已从总线消失时的最后手段——重新枚举 USB 根集线器
+	bool ReenumerateRootHubs();
+	// v4.209: 停 ADC（幂等，2 s 超时）。在拆除主机端点之前调用，避免固件
+	//   在 DMA 仍有在途数据时被 STOPFX3 卡死（实测 10 s 超时 → 设备掉线）。
+	bool StopAdc();
+	// v4.209: 远程免插拔恢复。T1 Cypress 端口循环 → T2 父端口复位 →
+	//   T3 PnP 重新枚举。任一成功即返回 true，调用方随后重新 Open。
+	bool PortRecover();
+	// v4.209: 恢复后重建设备对象（按需重载固件），idx 0..7 逐个尝试
+	bool ReenumerateAny();
+	// v4.210: 可中断等待。深度恢复的 15 s 退避必须能被退出请求打断，
+	//   否则 SkimSrv 退出后残留 ADC 线程会拖住进程（最长 20×15 s）。
+	//   返回 false 表示等待期间收到停止请求。
+	bool SleepInterruptible(DWORD ms);
+	// v4.211: 立即置 run=false，不 join、不碰设备。StopRx 的第一动作。
+	//   必须在 StopAdc / UsbClose 之前调用：否则 ADC 线程可能正处于恢复
+	//   路径中，会重新 Open 设备并发 STARTFX3（退出期间把 DMA 重新拉起）。
+	void RequestStop();
+	// v4.211: StopStream 的 join 是否超时脱管。true 表示 ADC 线程仍存活
+	//   且持有 fx3dev —— 调用方必须放弃 UsbClose，否则是 UAF/挂死。
+	bool AdcDetached() const { return adcDetached; }
  	bool Enumerate(unsigned char &idx, char *lbuf);
 private:
 	bool SendI2cbytes(uint8_t i2caddr, uint8_t regaddr, uint8_t* pdata, uint8_t len);
@@ -99,6 +120,9 @@ private:
 
 	bool GetFx3DeviceStreamer();
 	bool Fx3IsOn;
+	bool fx3StopSent = false;   // v4.209: STOPFX3 幂等标记（每次 Open 复位）
+	bool adcDetached = false;   // v4.211: StopStream join 超时脱管
+	bool rootHubReenumDone = false; // v4.211: 根集线器重枚举每次事件只做一次
 	bool Close(void);
 public:
 	void AdcSamplesProcess();   // v4.176: public for Win32 thunk access

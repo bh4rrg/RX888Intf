@@ -33,5 +33,5 @@ if errorlevel 1 (
 echo [OK] built %OUT%
 for %%F in (%OUT%) do echo [SIZE] %%~zF bytes
 echo.
-echo [HINT] verify SIMD: objdump -d -M intel %OUT% ^| findstr /c:"vfmadd"  (must be >0 in WorkerTramp; x87 fmul/faddp should be ~0)
+echo [HINT] verify SIMD: objdump -d -M intel %OUT% ^| findstr /c:"vfmadd"  (must be nonzero in WorkerTramp; x87 fmul/faddp should be ~0)
 endlocal

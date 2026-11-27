@@ -1,4 +1,4 @@
-//
+﻿//
 // FX3handler.cpp 
 // 2020 10 12  Oscar Steila ik1xpv
 // loading arm code.img from resource by Howard Su and Hayati Ayguen
@@ -402,11 +402,135 @@ bool fx3handler::SoftwareReplug() {
 		break;
 	}
 	SetupDiDestroyDeviceInfoList(hDevInfo);
+	if (!ok) {
+		// v4.209: 设备可能已从总线消失（10:45 现场：根本没有 VID_04B4 节点，
+		//   上面的循环一次都不命中）。此时唯一还能动的是父端口所在的
+		//   USB 根集线器——让它重新扫描端口，设备有机会重新被识别。
+		DbgPrintfForce("[SDDC] SoftwareReplug: device node not recoverable, "
+			"re-enumerating USB root hubs\n");
+		ok = ReenumerateRootHubs();
+	}
 	if (ok) {
 		DbgPrintf("SoftwareReplug: waiting for firmware reload\n");
 		Sleep(3000);
 	}
 	return ok;
+}
+
+// v4.209: 重新枚举 USB 根集线器——设备已从总线消失时的最后一级软件手段。
+//   只动 ROOT_HUB，不影响下游其它设备的具体节点；需要管理员权限，失败无害。
+bool fx3handler::ReenumerateRootHubs() {
+	// v4.211: 每次掉线事件只做一次。此前每个 PortRecover 轮次都会全量重枚举
+	//   所有根集线器（最多 21 轮），远程站上等于反复拔插键鼠/网卡所在端口。
+	//   成功 Open 后 rootHubReenumDone 会复位，下一次独立事件仍可用。
+	if (rootHubReenumDone) {
+		DbgPrintfForce("[SDDC] ReenumerateRootHubs: already done for this incident, skip\n");
+		return false;
+	}
+	rootHubReenumDone = true;
+
+	HDEVINFO h = SetupDiGetClassDevsA(nullptr, "USB", nullptr,
+		DIGCF_PRESENT | DIGCF_ALLCLASSES);
+	if (h == INVALID_HANDLE_VALUE) return false;
+	bool ok = false;
+	SP_DEVINFO_DATA di;
+	di.cbSize = sizeof(di);
+	for (DWORD i = 0; SetupDiEnumDeviceInfo(h, i, &di); i++) {
+		char devId[256];
+		DWORD sz = 0;
+		if (!SetupDiGetDeviceInstanceIdA(h, &di, devId, sizeof(devId), &sz))
+			continue;
+		// v4.211: "USB\ROOT_HUB" 是 12 个字符。此前写 13 会连后一位一起比，
+		//   导致 ROOT_HUB20 不匹配、只有 ROOT_HUB30 命中（本机恰好掩盖了缺陷）。
+		if (_strnicmp(devId, "USB\\ROOT_HUB", 12) != 0) continue;
+		SP_PROPCHANGE_PARAMS pcp;
+		ZeroMemory(&pcp, sizeof(pcp));
+		pcp.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+		pcp.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+		pcp.StateChange = DICS_PROPCHANGE;
+		pcp.Scope = DICS_FLAG_GLOBAL;
+		pcp.HwProfile = 0;
+		if (SetupDiSetClassInstallParamsA(h, &di, &pcp.ClassInstallHeader, sizeof(pcp)) &&
+			SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, h, &di)) {
+			DbgPrintfForce("[SDDC] ReenumerateRootHubs: %s -> OK\n", devId);
+			ok = true;
+		} else {
+			DbgPrintfForce("[SDDC] ReenumerateRootHubs: %s -> failed (%lu)\n",
+				devId, GetLastError());
+		}
+	}
+	SetupDiDestroyDeviceInfoList(h);
+	if (ok) {
+		DbgPrintfForce("[SDDC] ReenumerateRootHubs: waiting for devices to come back\n");
+		Sleep(4000);
+	}
+	return ok;
+}
+
+// v4.209: 停 ADC——幂等，且用 2 s 控制超时。
+// 现场（2026-11-24 10:40:50）：主机侧先 StopStream（端点已拆）再发 STOPFX3，
+// 控制传输卡满 10 s 后失败，设备随即从总线消失，此后每次 Open 都失败，
+// 只能物理插拔。发送时机与超时长度都改为可控。
+bool fx3handler::StopAdc() {
+	if (fx3StopSent) return true;
+	fx3StopSent = true;              // 无论成败只发一次
+	if (!fx3dev) return false;
+	fx3dev->ControlEndPt->TimeOut = 2000;
+	bool r = Control(STOPFX3);
+	DbgPrintfForce("[SDDC] StopAdc: STOPFX3 %s\n", r ? "ok" : "FAILED (firmware not responding)");
+	return r;
+}
+
+// v4.209: 远程免插拔恢复阶梯。目标：设备不在身边时不允许出现"必须拔线"的状态。
+//   T1 IOCTL_ADAPT_CYCLE_PORT：Cypress 驱动层端口循环（最接近物理拔插）
+//   T2 IOCTL_ADAPT_RESET_PARENT_PORT：复位父端口
+//   T3 SoftwareReplug：CM_Reenumerate_DevNode / DIF_PROPERTYCHANGE
+// T1/T2 走 CyUSB 设备句柄，不需要管理员权限，是远程环境的首选。
+bool fx3handler::PortRecover() {
+	wdTeardownStrayGuard();          // 先释放可能残留的守护场景
+	bool ioctlOk = false;
+	if (fx3dev) {
+		DbgPrintfForce("[SDDC] PortRecover: T1 cycle port (IOCTL_ADAPT_CYCLE_PORT)\n");
+		ioctlOk = fx3dev->ReConnect();
+		DbgPrintfForce("[SDDC] PortRecover: T1 -> %s\n", ioctlOk ? "OK" : "failed");
+		if (!ioctlOk) {
+			DbgPrintfForce("[SDDC] PortRecover: T2 reset parent port (IOCTL_ADAPT_RESET_PARENT_PORT)\n");
+			ioctlOk = fx3dev->Reset();
+			DbgPrintfForce("[SDDC] PortRecover: T2 -> %s\n", ioctlOk ? "OK" : "failed");
+		}
+		// 执行过 T1/T2 后原句柄必然失效。不 delete：MinGW 下 CCyFX3Device
+		//   析构不安全（见 UsbClose 注释），与既有策略一致，只置空。
+		fx3dev->Close();
+		fx3dev = nullptr;
+	}
+	Fx3IsOn = false;
+	fx3StopSent = false;
+	if (ioctlOk) {
+		DbgPrintfForce("[SDDC] PortRecover: waiting for re-enumeration\n");
+		Sleep(3000);
+	}
+	if (ReenumerateAny()) return true;
+
+	DbgPrintfForce("[SDDC] PortRecover: T3 PnP re-enumerate (fallback)\n");
+	if (!SoftwareReplug()) return false;
+	return ReenumerateAny();
+}
+
+// v4.209: 恢复后重建设备对象（必要时按 bootloader 状态重载固件）。
+bool fx3handler::ReenumerateAny() {
+	for (unsigned char i = 0; i < 8; i++) {
+		char lbuf[128] = "";
+		unsigned char idx = i;
+		bool en = false;
+		try { en = Enumerate(idx, lbuf); } catch (...) { en = false; }
+		if (en) {
+			DbgPrintfForce("[SDDC] PortRecover: re-enumerate ok, idx=%d ('%s')\n",
+				(int)i, lbuf);
+			return true;
+		}
+	}
+	DbgPrintfForce("[SDDC] PortRecover: re-enumerate FAILED (no device on bus)\n");
+	return false;
 }
 
 bool  fx3handler::Open() {
@@ -477,6 +601,9 @@ bool  fx3handler::Open() {
 	}
 
 	Fx3IsOn = true;
+	fx3StopSent = false;     // v4.209: 新会话允许发一次 STOPFX3
+	rootHubReenumDone = false; // v4.211: 设备已正常打开，下一次掉线是独立事件
+	adcDetached = false;
 	return Fx3IsOn;          // init success
 }
 
@@ -485,6 +612,8 @@ using namespace std;
 
 bool fx3handler::Control(FX3Command command, UINT8 data) { // firmware control BBRF
 	long lgt = 1;
+	if (!fx3dev) return false;                    // v4.209: 设备对象已释放
+	fx3dev->ControlEndPt->TimeOut = 2000;         // v4.209: 不阻塞 10 s
 
 	// v4.173: commands the RX666 firmware does not implement (official DLL
 	// never sends them; measured FAILED). Report success to keep the caller's
@@ -528,6 +657,8 @@ bool fx3handler::Control(FX3Command command, UINT8 data) { // firmware control B
 
 bool fx3handler::Control(FX3Command command, UINT32 data) { // firmware control BBRF
 	long lgt = 4;
+	if (!fx3dev) return false;                    // v4.209
+	fx3dev->ControlEndPt->TimeOut = 2000;         // v4.209
 
 	// v4.173: same RX666 handling as the UINT8 overload. STARTADC arrives
 	// here (adc_rate as UINT32); suppress instead of sending an unsupported
@@ -556,6 +687,8 @@ bool fx3handler::Control(FX3Command command, UINT32 data) { // firmware control 
 
 bool fx3handler::Control(FX3Command command, UINT64 data) { // firmware control BBRF
 	long lgt = 8;
+	if (!fx3dev) return false;                    // v4.209
+	fx3dev->ControlEndPt->TimeOut = 2000;         // v4.209
 
 	fx3dev->ControlEndPt->ReqCode = command;
 	fx3dev->ControlEndPt->Value = (USHORT)0;
@@ -659,7 +792,10 @@ bool fx3handler::Close() {
 	//   表现为下次启动 WaitForXfer 超时、只能物理拔插。
 	if (fx3dev && Fx3IsOn) {
 		DbgPrintf("Close: sending STOPFX3 before exit\n");
-		Control(STOPFX3);
+		// v4.209: 幂等（StopRx 已发过则跳过）；失败要留证据，不能再静默
+		if (!StopAdc())
+			DbgPrintfForce("[SDDC] Close: firmware unresponsive to STOPFX3 - "
+				"next start will run PortRecover\n");
 		Sleep(50);
 	}
 	if (fx3dev) {               // v4.195: null-safe (fx3dev may be null after
@@ -1030,8 +1166,12 @@ void fx3handler::AdcSamplesProcess()
 	unsigned long lastRecoverTick = 0;  // v4.195: GetTickCount of last recovery end
 	bool recoveryFirstAttempt = true;   // v4.195: true until first recovery in this incident
 	bool replugTried = false;           // v4.205: 本次运行是否已尝试软件复位
+	int  deepRetries = 0;               // v4.209: 深度恢复轮次（远程免插拔）
 	while (run) {
  		if (!FinishDataXfer(&contexts[read_idx])) {
+ 			// v4.209: 计划内停止（StopRx 已先发 STOPFX3）——数据流中断是
+ 			//   预期行为，绝不能进入恢复流程去重开设备。
+ 			if (fx3StopSent) break;
  			// v4.174: auto-recovery instead of immediate break.
  			// On FinishDataXfer failure the USB bulk pipe or firmware DMA
  			// is in a bad state.  Try to recover by cycling the USB
@@ -1043,37 +1183,55 @@ void fx3handler::AdcSamplesProcess()
  			// If all attempts fail, the thread exits with a loud alarm
  			// block (was: silent exit, skimmer died without a trace).
 			if (recoverCount >= USB_MAX_RECOVER) {
-				// v4.205: 预算耗尽时先试软件复位（重新枚举设备节点）。
-				//   固件半死状态下 STOPFX3/STARTFX3 都无效，重新枚举能让
-				//   固件重新加载，从而免去物理拔插。成功则重置预算继续走
-				//   下面的清理/重开/启动流程。
-				if (!replugTried && SoftwareReplug()) {
+				// v4.205/v4.209: 预算耗尽时做恢复阶梯（端口循环 → 父端口复位
+				//   → PnP 重新枚举）。远程站不允许依赖人工插拔：任一层让设备
+				//   重新枚举成功，固件即重载，解码自动恢复。
+				if (!replugTried && PortRecover()) {
 					replugTried = true;
-					DbgPrintfForce("[SDDC] Software replug OK - retrying open/start\n");
+					DbgPrintfForce("[SDDC] Port recovery OK - retrying open/start\n");
 					recoverCount = 0;
 				}
 			}
 			if (recoverCount >= USB_MAX_RECOVER) {
-				DbgPrintfForce("\n");
-				DbgPrintfForce("======================================================================\n");
-				DbgPrintfForce("  USB RECOVERY EXHAUSTED after %d attempts (" RX888INTF_VERSION ")\n", recoverCount);
-				DbgPrintfForce("  Root cause: firmware DMA / USB pipe hard-dead (CRC errors).\n");
-				// v4.208: 按实跑固件报，不再硬编码 RX666（本机曾因此误判硬件）。
-				if (gFwIsRx666) {
-					DbgPrintfForce("  Running RX666 firmware ('FX3'), HwModel=%s. RX666 firmware has\n",
-						GetHwModel() == HW_MODEL_RX666 ? "RX666" : "RX888");
-					DbgPrintfForce("  no RESETFX3 support, so no software reset is possible.\n");
+				// v4.209: 远程站——不立即放弃。最多 20 轮 × 15 s（约 5 分钟）
+				//   深度恢复：每轮先等 15 s（给固件/USB 栈自愈时间），再放开
+				//   阶梯重试标记并走一轮常规重开。任一轮成功即恢复解码。
+				if (deepRetries < 20) {
+					deepRetries++;
+					DbgPrintfForce("[SDDC] Recovery: deep retry %d/20 (15 s backoff, "
+						"then port recovery)\n", deepRetries);
+					// v4.210: 退避必须可中断。此前是裸 Sleep(15000)，退出时
+					//   最坏要等 20×15 s，进程一直挂在任务列表里。
+					if (!SleepInterruptible(15000)) break;
+					replugTried = false;
+					recoverCount = 0;
 				} else {
-					DbgPrintfForce("  Running RX888 firmware ('SDR'), HwModel=%s.\n",
-						GetHwModel() == HW_MODEL_RX666 ? "RX666" : "RX888");
+					DbgPrintfForce("\n");
+					DbgPrintfForce("======================================================================\n");
+					DbgPrintfForce("  USB RECOVERY EXHAUSTED after %d attempts + 20 deep retries (" RX888INTF_VERSION ")\n", USB_MAX_RECOVER);
+					DbgPrintfForce("  Automated recovery already attempted: port cycle, parent\n");
+					DbgPrintfForce("  port reset, PnP re-enumerate. The device did not come back.\n");
+					// v4.208: 按实跑固件报，不再硬编码 RX666（本机曾因此误判硬件）。
+					if (gFwIsRx666) {
+						DbgPrintfForce("  Running RX666 firmware ('FX3'), HwModel=%s.\n",
+							GetHwModel() == HW_MODEL_RX666 ? "RX666" : "RX888");
+					} else {
+						DbgPrintfForce("  Running RX888 firmware, HwModel=%s.\n",
+							GetHwModel() == HW_MODEL_RX666 ? "RX666" : "RX888");
+					}
+					DbgPrintfForce("  ACTION REQUIRED: power-cycle the USB port (remote power\n");
+					DbgPrintfForce("  switch) or replug the cable, then restart SkimSrv.\n");
+					DbgPrintfForce("  The ADC thread is stopping NOW to avoid writing a\n");
+					DbgPrintfForce("  half-dead stream into the DSP.\n");
+					DbgPrintfForce("======================================================================\n");
+					DbgPrintfForce("\n");
+					break;
 				}
-				DbgPrintfForce("  ACTION REQUIRED: unplug+replug the USB cable, then restart\n");
-				DbgPrintfForce("  SkimSrv. The ADC thread is stopping NOW to avoid writing a\n");
-				DbgPrintfForce("  half-dead stream into the DSP.\n");
-				DbgPrintfForce("======================================================================\n");
-				DbgPrintfForce("\n");
-				break;
 			}
+
+			// v4.210: 退出请求优先于恢复。StopRx 已经设置 run=false 时，
+			//   不再重开设备（否则会在退出过程中把设备重新拉起来，拖住进程）。
+			if (!run) break;
 
 			// v4.195: re-entry after a watchdog timeout — the abandoned guard
 			// owns its own scene/device/event; release the scene BEFORE
@@ -1177,6 +1335,7 @@ void fx3handler::AdcSamplesProcess()
 			DbgPrintf("Recovery: flow stable >=%d ms, fresh recovery budget\n",
 				(int)USB_STORM_WINDOW_MS);
 			recoverCount = 0;
+			deepRetries = 0;            // v4.209: 稳定流才清空深度恢复计数
 			recoveryFirstAttempt = true;
 			lastRecoverTick = 0;
 		}
@@ -1229,27 +1388,43 @@ void fx3handler::StartStream(ringbuffer<int16_t>& input, int numofblock)
 	adc_thread_handle = CreateThread(nullptr, 0, AdcSamplesProcThunk, this, 0, nullptr);
 }
 
+// v4.210: 可中断等待——深度恢复的退避期间若收到停止请求，立即返回 false。
+//   解决"从界面退出后进程仍留在任务列表"：此前裸 Sleep(15000) × 20 轮会把
+//   ADC 线程拖住最长 5 分钟，SkimSrv 无法完成卸载。
+bool fx3handler::SleepInterruptible(DWORD ms)
+{
+	DWORD end = GetTickCount() + ms;
+	while (run) {
+		DWORD now = GetTickCount();
+		if (now >= end) return true;
+		DWORD left = end - now;
+		Sleep(left > 50 ? 50 : left);
+	}
+	return false;
+}
+
+void fx3handler::RequestStop()
+{
+	// v4.211: 只置标志，不 join、不碰设备。见 FX3handler.h 说明。
+	run = false;
+}
+
 void fx3handler::StopStream()
 {
 	DbgPrintf("StopStream: set run=false\n");
 	run = false;
 	DbgPrintf("StopStream: WaitForSingleObject begin\n");
 	if (adc_thread_handle) {
-		DWORD w = WaitForSingleObject(adc_thread_handle, 10000);
+		// v4.211: 上限 20 s。单次恢复最坏链路 = ReopenWatchdog(10 s) +
+		//   两次 1 s 退避 + 重排队，10 s 会在正常恢复中途误判脱管。
+		DWORD w = WaitForSingleObject(adc_thread_handle, 20000);
 		if (w == WAIT_TIMEOUT) {
-			// v4.195: recovery rounds can now take up to ~13 s each (watchdog
-			// bound), so a stop during recovery may legitimately exceed the
-			// 10 s join. Detach (handle close) but DO NOT null inputbuffer:
-			// the ring object outlives this call (StopRx never deletes it,
-			// v4.177 leak policy), and the ADC thread touches it once more
-			// before honouring run=false. Nulling it here was a use-after-
-			// null race (StopStream caller vs recovery path).
-			// v4.198: DbgPrintf -> DbgPrintfForce——脱管属于必须知晓的事件
-			//（残留 ADC 线程会拖住进程退出，v4.191 实测 ~40 s），LogMode=0
-			// 静默模式下同样必须落盘。
-			DbgPrintfForce("StopStream: ADC thread still busy after 10 s (recovery in "
-				"progress?) - detached, inputbuffer left valid (process exit "
-				"may be delayed by up to ~40 s)\n");
+			// 脱管：ADC 线程仍持有 fx3dev。绝不置空 inputbuffer，并由
+			//   adcDetached 告知 StopRx 放弃 UsbClose（v4.211，防 UAF）。
+			//   ring 对象本身不释放（v4.177 泄漏策略），故此刻是安全的。
+			DbgPrintfForce("StopStream: ADC thread still busy after 20 s (recovery in "
+				"progress?) - detached, device close MUST be skipped by caller\n");
+			adcDetached = true;
 		}
 		else {
 			DbgPrintf("StopStream: WaitForSingleObject done\n");

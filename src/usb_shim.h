@@ -23,7 +23,11 @@ void UsbClose(void** dev);
 bool UsbStartStream(void* dev, void** ring);
 
 // 停止 USB 流（唤醒消费线程 + join 采集线程；ring 对象保留，不在此释放）
-void UsbStopStream(void* dev, void* ring);
+// v4.211: 返回 false 表示 ADC 线程 join 超时脱管——调用方不得再 UsbClose。
+bool UsbStopStream(void* dev, void* ring);
+
+// v4.211: 只置 ADC 线程的 run=false（不 join、不碰设备）。StopRx 第一动作。
+void UsbRequestStop(void* dev);
 
 // 释放环形缓冲（仅在消费线程退出后调用，见 skimsrv_intf StopRx 顺序）
 void UsbFreeRing(void** ring);
@@ -42,6 +46,14 @@ int UsbRingFullCount(void* ring);
 // v4.204: 只发 STOPFX3，不 join 任何线程、不做阻塞等待。
 // 仅供 DLL_PROCESS_DETACH 使用（进程已在退出，禁止长时间阻塞）。
 void UsbEmergencyStop(void);
+
+// v4.209: 在拆除主机端点之前先停 ADC（幂等、2 s 超时）。
+// 现场实测：端点先拆再发 STOPFX3 会让控制传输卡满 10 s 并导致设备掉线。
+void UsbStopAdc(void* dev);
+
+// v4.209: 远程免插拔恢复（端口循环 → 父端口复位 → PnP 重新枚举）。
+// 设备对象已释放或从未建立时仍会走 PnP 回退。成功返回 true。
+bool UsbPortRecover(void* dev);
 
 #ifdef __cplusplus
 }

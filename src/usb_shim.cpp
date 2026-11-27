@@ -206,12 +206,20 @@ bool UsbStartStream(void* dev, void** ring) {
     return true;
 }
 
-void UsbStopStream(void* dev, void* ring) {
+bool UsbStopStream(void* dev, void* ring) {
     UsbLog("UsbStopStream: ring Stop() begin");
     if (ring) static_cast<ringbuffer<int16_t>*>(ring)->Stop();  // 唤醒 getReadPtr 阻塞
     UsbLog("UsbStopStream: gDev StopStream() begin");
     if (gDev) gDev->StopStream();
     UsbLog("UsbStopStream: done");
+    // v4.211: join 超时脱管时返回 false，调用方须跳过 UsbClose。
+    return gDev ? !gDev->AdcDetached() : true;
+}
+
+// v4.211: StopRx 第一动作——关闭 ADC 线程"重新打开设备"的窗口。
+void UsbRequestStop(void* dev) {
+    (void)dev;
+    if (gDev) gDev->RequestStop();
 }
 
 // v4.204: 进程退出路径专用——只发 STOPFX3，不 join、不等待。
@@ -219,6 +227,28 @@ void UsbEmergencyStop(void) {
     if (!gDev) return;
     UsbLog("UsbEmergencyStop: STOPFX3 (no joins)");
     gDev->Control(STOPFX3);
+}
+
+// v4.209: 拆除主机端点之前先停 ADC（幂等、2 s 超时）。
+void UsbStopAdc(void* dev) {
+    (void)dev;
+    if (!gDev) return;
+    UsbLog("UsbStopAdc: STOPFX3 before endpoint teardown");
+    gDev->StopAdc();
+}
+
+// v4.209: 远程免插拔恢复——端口循环 → 父端口复位 → PnP 重新枚举。
+bool UsbPortRecover(void* dev) {
+    (void)dev;
+    if (!gDev) {
+        gDev = new fx3handler();
+        if (!gDev) return false;
+    }
+    UsbLog("UsbPortRecover: begin");
+    bool ok = false;
+    try { ok = gDev->PortRecover(); } catch (...) { ok = false; }
+    UsbLog("UsbPortRecover: %s", ok ? "device back" : "FAILED");
+    return ok;
 }
 
 void UsbFreeRing(void** ring) {

@@ -1083,6 +1083,9 @@ int __stdcall GetSdrInfo(SdrInfo *pInfo) {
     return 1;   // 1=success
 }
 
+// v4.211: 前向声明——StartRx 检测到重入时需要先完整收尾旧会话
+extern "C" __declspec(dllexport) void __stdcall StopRx(void);
+
 // ---------------------------------------------------------------------------
 // 导出函数 2：StartRx
 // ---------------------------------------------------------------------------
@@ -1091,6 +1094,15 @@ void __stdcall StartRx(void* rawParams) {
     LogOpen();
     Log("StartRx called");
     if (rawParams == nullptr) return;
+
+    // v4.211: 重入保护。若 SkimSrv 在未 StopRx 的情况下再次 StartRx，旧会话的
+    //   ADC/交付线程仍在跑，直接重建会得到两个采集线程抢同一个 ring——实测
+    //   表现就是"解码数 0"或"CPU 只跑一半"。先完整收尾再开新会话。
+    if (gStarted || gUsbOk) {
+        FatalLog("[SDDC] StartRx re-entry (started=%d usb=%d) - stopping previous session first",
+            (int)gStarted, (int)gUsbOk);
+        StopRx();
+    }
 
     // 按老驱动的 StartRxParams 布局解析 SkimSrv 传入的参数
     memcpy(&gSet, rawParams, sizeof(gSet));
@@ -1135,9 +1147,17 @@ void __stdcall StartRx(void* rawParams) {
 
     // 打开 USB（固件下载 + STREAMER 枚举 + STARTADC 64M）
     if (!UsbOpen(&gFx3, ADC_FREQ)) {
-        ReportError("RX888 open failed (USB)");
-        FreeBlocks();
-        return;
+        // v4.209: 远程站不允许"打不开就只能拔线"。先做一次恢复阶梯
+        //   （端口循环/父端口复位/PnP 重新枚举），成功后重试一次。
+        FatalLog("USB: open failed - attempting port recovery (no manual replug needed)");
+        if (UsbPortRecover(gFx3) && UsbOpen(&gFx3, ADC_FREQ)) {
+            FatalLog("USB: open recovered after port reset/cycle");
+        } else {
+            FatalLog("USB: port recovery FAILED - device not on bus");
+            ReportError("RX888 open failed (USB)");
+            FreeBlocks();
+            return;
+        }
     }
     gUsbOk = true;
 
@@ -1378,15 +1398,30 @@ static void CheckDecodersReadOnly() {
 // ---------------------------------------------------------------------------
 extern "C" __declspec(dllexport)
 void __stdcall StopRx(void) {
-    Log("StopRx called (started=%d)", (int)gStarted);
-    if (!gStarted) return;
+    // v4.210: 改为强制日志——LogMode=0 时也要能看到退出时序，
+    //   否则"退出后进程残留"无法定位卡在哪个阶段。
+    FatalLog("[SDDC] StopRx begin (started=%d usb=%d)", (int)gStarted, (int)gUsbOk);
+    // v4.211: 只要设备可能已打开就必须收尾。旧代码在 gStarted=false 时直接
+    //   return，于是 StartRx 半途失败（UsbOpen 成功、CreateThread 失败）留下
+    //   的已打开设备无人关闭，下次启动打不开。
+    if (!gStarted && !gUsbOk) return;
 
     // v4.176: 停止顺序根治 UAF 崩溃（旧序：交付线程仍持 ring/块缓冲指针就 delete）
     //   1. 置停止标志  2. 唤醒交付线程并停采集线程（ring 不释放）
     //   3. 等交付线程退出  4. 再释放 ring / 设备 / 块缓冲
     gStopReq = true;
+    // v4.211: 第一动作就置 run=false——在 StopAdc/UsbClose 之前关闭 ADC 线程
+    //   的恢复窗口，避免它在退出过程中重新 Open 设备并发 STARTFX3。
+    UsbRequestStop(gFx3);
+    // v4.209: 先停 ADC 再拆主机端点。现场（2026-11-24 10:40:50）实测：
+    //   端点先拆、再发 STOPFX3 时，控制传输卡满 10 s 后失败，设备随即从
+    //   总线消失，此后每次 Open 都失败，只能物理插拔。改在管道仍存活时
+    //   停 ADC，固件才有机会正常响应。StopAdc 幂等，Close() 不会重复发。
+    Log("StopRx: step0 UsbStopAdc begin");
+    UsbStopAdc(gFx3);
     Log("StopRx: step1 UsbStopStream begin");
-    UsbStopStream(gFx3, gRing);          // ring Stop() 唤醒 getReadPtr + 停采集线程
+    // v4.211: 返回 false = ADC 线程 join 超时脱管，后续禁止 UsbClose
+    bool adcDetached = !UsbStopStream(gFx3, gRing);  // ring Stop() 唤醒 getReadPtr + 停采集线程
     Log("StopRx: step2 WaitForDeliverThread begin (gThread=%p)", gThread);
     if (gThread) {
         // v4.181: 等安全点而非等退出——交付线程到安全点后挂起（不 return），
@@ -1426,14 +1461,20 @@ void __stdcall StopRx(void) {
     Log("StopRx: step3 UsbFreeRing begin");
     gRunning = false;
     UsbFreeRing(&gRing);                  // 交付线程已退出，安全释放
-    Log("StopRx: step4 UsbClose begin");
-    UsbClose(&gFx3);
+    // v4.211: ADC 线程脱管时它仍持有 fx3dev，此时 UsbClose 是 UAF/挂死。
+    //   宁可泄漏句柄（进程退出由 OS 回收），也不在线程活着时关设备。
+    if (adcDetached) {
+        FatalLog("[SDDC] StopRx: ADC thread detached - SKIPPING UsbClose (handle leaked)");
+    } else {
+        Log("StopRx: step4 UsbClose begin");
+        UsbClose(&gFx3);
+    }
     Log("StopRx: step5 FreeBlocks begin");
     gUsbOk = false;
     FreeBlocks();
     gDspReady = false;
     gStarted = false;
-    LogI("StopRx done, delivered=%lu", gBlocksDelivered);
+    FatalLog("[SDDC] StopRx done, delivered=%lu", gBlocksDelivered);
 }
 
 // ---------------------------------------------------------------------------
@@ -1518,8 +1559,11 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID lpReserved) {
             //   这里只需把 FX3 停流，避免 DMA 卡死到下次启动。
             if (gStarted) {
                 if (lpReserved == nullptr) {
+                    FatalLog("[SDDC] DllMain DETACH (FreeLibrary) begin");
                     StopRx();               // FreeLibrary 主动卸载：完整收尾
+                    FatalLog("[SDDC] DllMain DETACH (FreeLibrary) end");
                 } else {
+                    FatalLog("[SDDC] DllMain DETACH (process exit) - emergency stop");
                     UsbEmergencyStop();     // 进程终止：只发 STOPFX3，不 join
                 }
             }
